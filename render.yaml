@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: multi-live
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python multi_live.py"
+    envVars:
+      - key: TZ
+        value: Europe/Paris
+      - key: PYTHON_VERSION
+        value: "3.11.9"

@@ -1,0 +1,1 @@
+# Aucune dépendance : le script n utilise que Python standard.
