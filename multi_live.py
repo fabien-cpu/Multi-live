@@ -27,6 +27,7 @@ Python 3.8+ — rien à installer.
 """
 
 import argparse
+import itertools
 import base64
 import json
 import os
@@ -38,6 +39,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -96,33 +98,60 @@ def arrivee_course(jour, r, c):
     return [n for groupe in ordre for n in (groupe if isinstance(groupe, list) else [groupe])]
 
 
+def lire_partants(jour, r, c):
+    data = get_json(f"{API}/{jour}/R{r}/C{c}/participants?specialisation=INTERNET")
+    partants = []
+    for p in data.get("participants", []):
+        direct = (p.get("dernierRapportDirect") or {}).get("rapport")
+        ref = (p.get("dernierRapportReference") or {}).get("rapport")
+        gains = (p.get("gainsParticipant") or {}).get("gainsCarriere")
+        partants.append({
+            "num": p.get("numPmu"), "nom": p.get("nom", "?"),
+            "partant": str(p.get("statut", "PARTANT")).upper() == "PARTANT",
+            "musique": p.get("musique", "") or "",
+            "driver": p.get("driver") or p.get("jockey") or "",
+            "entraineur": p.get("entraineur", "") or "",
+            "courses": p.get("nombreCourses") or 0,
+            "victoires": p.get("nombreVictoires") or 0,
+            "places": p.get("nombrePlaces") or 0,
+            "gains": (gains or 0) / 100,
+            "coteMatin": float(ref) if ref else None,
+            "coteDirect": float(direct) if direct else None,
+            "ordreArrivee": p.get("ordreArrivee"),
+        })
+    arrivee = sorted((p for p in partants if p.get("ordreArrivee")), key=lambda p: p["ordreArrivee"])
+    arrivee = [p["num"] for p in arrivee] or arrivee_course(jour, r, c)
+    return partants, arrivee
+
+
+def rapports_multi(jour, r, c):
+    """Rapports définitifs du Multi : {"en4": €, "en5": €, "en6": €, "en7": €, "mise": €} pour une mise de base."""
+    try:
+        data = get_json(f"{API}/{jour}/R{r}/C{c}/rapports-definitifs?specialisation=INTERNET")
+    except Exception:
+        return None
+    if isinstance(data, dict):   # selon les versions de l'API, la liste peut être rangée dans une clé
+        data = next((v for v in data.values() if isinstance(v, list)), [])
+    for pari in data:
+        if "MULTI" not in str(pari.get("typePari", "")).upper():
+            continue
+        out = {"mise": (pari.get("miseBase") or 300) / 100, "rembourse": bool(pari.get("rembourse"))}
+        for rp in pari.get("rapports", []) or []:
+            lib = str(rp.get("libelle", "")).lower()
+            for k in ("4", "5", "6", "7"):
+                if lib.endswith("en " + k):
+                    d = rp.get("dividendePourUneMiseDeBase") or rp.get("dividende")
+                    if d:
+                        out["en" + k] = d / 100
+        return out
+    return None
+
+
 def details_course(jour, r, c):
     if DEMO:
         partants, arrivee = demo_partants()
     else:
-        data = get_json(f"{API}/{jour}/R{r}/C{c}/participants?specialisation=INTERNET")
-        partants = []
-        for p in data.get("participants", []):
-            direct = (p.get("dernierRapportDirect") or {}).get("rapport")
-            ref = (p.get("dernierRapportReference") or {}).get("rapport")
-            gains = (p.get("gainsParticipant") or {}).get("gainsCarriere")
-            partants.append({
-                "num": p.get("numPmu"), "nom": p.get("nom", "?"),
-                "partant": str(p.get("statut", "PARTANT")).upper() == "PARTANT",
-                "musique": p.get("musique", "") or "",
-                "driver": p.get("driver") or p.get("jockey") or "",
-                "entraineur": p.get("entraineur", "") or "",
-                "courses": p.get("nombreCourses") or 0,
-                "victoires": p.get("nombreVictoires") or 0,
-                "places": p.get("nombrePlaces") or 0,
-                "gains": (gains or 0) / 100,
-                "coteMatin": float(ref) if ref else None,
-                "coteDirect": float(direct) if direct else None,
-                "ordreArrivee": p.get("ordreArrivee"),
-            })
-        arrivee = sorted((p for p in partants if p.get("ordreArrivee")),
-                         key=lambda p: p["ordreArrivee"])
-        arrivee = [p["num"] for p in arrivee] or arrivee_course(jour, r, c)
+        partants, arrivee = lire_partants(jour, r, c)
 
     # Historique des cotes (gardé en mémoire tant que le programme tourne)
     cle, now = (jour, r, c), int(time.time() * 1000)
@@ -188,6 +217,90 @@ def demo_partants():
     return out, []
 
 
+# ------------------------------------------------------------------ bilan des jours passés
+
+BILAN_CACHE = {}       # (jour, "HH:MM") -> résultat (les jours passés ne changent plus)
+
+
+def course_proche(courses, heure):
+    h, m = (int(x) for x in heure.split(":"))
+    cible = h * 60 + m
+    def ecart(c):
+        if not c.get("heure"):
+            return 10 ** 6
+        d = datetime.fromtimestamp(c["heure"] / 1000)
+        return abs(d.hour * 60 + d.minute - cible)
+    avec = [c for c in courses if c.get("multi")]
+    return min(avec, key=ecart) if avec else None
+
+
+def bilan_jour(jour, heure):
+    cle = (jour, heure)
+    if cle in BILAN_CACHE:
+        return BILAN_CACHE[cle]
+    try:
+        c = course_proche(liste_courses(jour), heure)
+        if not c:
+            res = None
+        else:
+            partants, arrivee = lire_partants(jour, c["r"], c["c"])
+            rap = rapports_multi(jour, c["r"], c["c"])
+            res = None
+            if rap and len(arrivee) >= 4:
+                for p in partants:
+                    p.pop("ordreArrivee", None)
+                res = {"date": jour, "r": c["r"], "c": c["c"], "hippodrome": c["hippodrome"],
+                       "libelle": c["libelle"], "heure": c["heure"], "multi": c["multi"],
+                       "partants": partants, "arrivee": arrivee[:4], "rapports": rap}
+    except Exception:
+        return None          # pas mis en cache : on réessaiera
+    BILAN_CACHE[cle] = res
+    return res
+
+
+def bilan(jours, heure):
+    if DEMO:
+        return demo_bilan(jours)
+    dates = [(datetime.now() - timedelta(days=i)).strftime("%d%m%Y") for i in range(1, jours + 1)]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        res = list(ex.map(lambda d: bilan_jour(d, heure), dates))
+    return [x for x in res if x]
+
+
+def demo_bilan(jours):
+    """Jours passés fictifs : arrivée tirée au sort selon les cotes, rapport ~ 75 % du juste prix."""
+    rnd = random.Random(42)
+    out = []
+    for i in range(1, jours + 1):
+        d = datetime.now() - timedelta(days=i)
+        partants = []
+        for n, nom, mus, matin, drv, crs, vic, pl in DEMO_CHEVAUX[:rnd.randint(13, 16)]:
+            cote = round(matin * rnd.uniform(0.5, 1.8), 1)
+            partants.append({"num": n, "nom": nom, "partant": True, "musique": mus, "driver": drv, "entraineur": "",
+                             "courses": crs, "victoires": vic, "places": pl, "gains": 0.0,
+                             "coteMatin": round(cote * rnd.uniform(0.85, 1.15), 1), "coteDirect": cote})
+        inv = {p["num"]: 1 / p["coteDirect"] for p in partants}
+        s = sum(inv.values())
+        p = {k: v / s for k, v in inv.items()}
+        reste, arr = dict(p), []
+        for _ in range(4):
+            tot = sum(reste.values())
+            x, acc = rnd.random() * tot, 0
+            for k, v in reste.items():
+                acc += v
+                if acc >= x:
+                    arr.append(k); reste.pop(k); break
+        pq = 0.0
+        for a, b, c, e in itertools.permutations(arr):
+            pq += p[a] * p[b] / (1 - p[a]) * p[c] / (1 - p[a] - p[b]) * p[e] / (1 - p[a] - p[b] - p[c])
+        en6 = round(0.75 * 3 / (15 * pq) * rnd.uniform(0.6, 1.5), 2)
+        out.append({"date": d.strftime("%d%m%Y"), "r": 1, "c": 3, "hippodrome": "VINCENNES", "libelle": "Course démo",
+                    "heure": int(d.replace(hour=13, minute=55).timestamp() * 1000), "multi": "Multi",
+                    "partants": partants, "arrivee": arr,
+                    "rapports": {"mise": 3.0, "en4": en6 * 15, "en5": en6 * 3, "en6": en6, "en7": round(en6 * 3 / 7, 2)}})
+    return out
+
+
 # ------------------------------------------------------------------ serveur web
 
 class Handler(BaseHTTPRequestHandler):
@@ -219,6 +332,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.envoyer(200, SW, "text/javascript; charset=utf-8")
             if u.path == "/api/courses":
                 return self.envoyer(200, json.dumps({"date": jour, "demo": DEMO, "courses": liste_courses(jour)}))
+            if u.path == "/api/bilan":
+                jours = max(1, min(60, int(q.get("jours", 30))))
+                heure = q.get("heure", "13:55")
+                return self.envoyer(200, json.dumps({"jours": jours, "heure": heure, "courses": bilan(jours, heure)}))
             if u.path == "/api/course":
                 d = details_course(jour, int(q["r"]), int(q["c"]))
                 return self.envoyer(200, json.dumps(d))
@@ -343,6 +460,21 @@ svg.spark{vertical-align:middle}
 .err{margin-top:12px;padding:10px 12px;border:1px solid var(--up);color:var(--up);border-radius:8px}
 .res{margin-top:12px;padding:10px 12px;border-radius:8px;border:1px solid var(--gold);color:var(--gold);font-weight:600}
 .foot{color:var(--muted);font-size:12px;margin:18px 0 8px}
+.ticket .n.small{width:34px;height:34px;font-size:15px;border-radius:7px}
+.verdict{margin-top:12px;padding:10px 12px;border-radius:8px;border:1px solid var(--line);display:grid;gap:2px}
+.verdict:empty{display:none}
+.verdict b{font-size:16px}
+.verdict span{font-size:12px;color:var(--muted)}
+.verdict.ok{border-color:var(--down);background:color-mix(in srgb,var(--down) 12%,transparent)} .verdict.ok b{color:var(--down)}
+.verdict.mid{border-color:var(--warn);background:color-mix(in srgb,var(--warn) 12%,transparent)} .verdict.mid b{color:var(--warn)}
+.verdict.ko{border-color:var(--up);background:color-mix(in srgb,var(--up) 10%,transparent)} .verdict.ko b{color:var(--up)}
+.bilan{margin-top:16px}
+.bcartes{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-top:10px}
+.bcard{border:1px solid var(--line);border-radius:8px;padding:12px;display:grid;gap:4px;min-width:0}
+.bcard h3{margin:0;font-size:14px}
+.bnet{font-size:24px;font-weight:700}
+table.btab{min-width:560px}
+
 </style></head><body><div class="wrap">
 
 <header>
@@ -369,15 +501,16 @@ svg.spark{vertical-align:middle}
     <div class="kpis">
       <div class="kpi"><b id="tProba">–</b><span>chance que les 4 premiers soient dedans</span></div>
       <div class="kpi"><b id="tChance">–</b><span>soit environ</span></div>
-      <div class="kpi"><b id="tSeuil">–</b><span>rapport mini pour être rentable</span></div>
+      <div class="kpi"><b id="tRapport">–</b><span>rapport estimé si gagnant <span id="tRapportDet"></span></span></div>
     </div>
+    <div id="v1" class="verdict"></div>
     <button class="copie" id="copier" type="button">Copier les numéros</button>
     <div class="flexi">
       <h2>Variante Flexi 50 % — 3 tickets à 1,50 € = 4,50 €</h2>
       <div id="fTickets"></div>
       <p class="note" id="fTotal"></p>
     </div>
-    <p class="note">Gains Flexi divisés par 2. Le rapport mini = mise ÷ probabilité : en dessous, le pari perd en moyenne.</p>
+    <p class="note">Le rapport estimé vient des cotes, calé sur les vrais rapports du Multi des 30 derniers jours. Le verdict ne vaut que si le bilan ci-dessous montre que l'appli fait mieux que les favoris.</p>
   </section>
 
   <section class="panel">
@@ -402,6 +535,15 @@ svg.spark{vertical-align:middle}
     </details>
   </section>
 </div>
+
+<section class="panel bilan">
+  <h2>Bilan des 30 derniers jours</h2>
+  <p class="sub" id="bEtat">Chargement…</p>
+  <div class="bcartes" id="bCartes"></div>
+  <details><summary>Détail jour par jour</summary>
+    <div class="tablewrap"><table class="btab"><thead><tr><th class="l">Jour</th><th class="l">Course</th><th class="l">Arrivée</th><th>Multi en 6</th><th>Appli</th><th>Flexi</th><th>Favoris</th></tr></thead><tbody id="bCorps"></tbody></table></div>
+  </details>
+</section>
 
 <div class="tablewrap">
 <table>
@@ -507,94 +649,124 @@ function normaliser(vals) {           // tableau de valeurs >=0 -> distribution
   const s = vals.reduce((a,b) => a+b, 0) || 1; return vals.map(v => v/s);
 }
 
-function calculer() {
-  if (!donnees) return;
-  const tous = donnees.partants;
-  const P = tous.filter(c => c.partant);
-  const n = P.length;
-  if (n < 4) { $("tNums").textContent = "Pas assez de partants."; return; }
-
-  // 1) Marché : PMU direct + autres sites, chaque source normalisée (marge retirée), puis moyenne
-  const parSource = [];
-  parSource.push(P.map(c => c.coteDirect || c.coteMatin || null));
-  for (const [nom, cotes] of Object.entries(sources)) parSource.push(P.map(c => cotes[c.num] || null));
+// ---------- modèle (utilisé pour la course en direct et pour le bilan des jours passés)
+function harvilleQ(pv, q) {            // proba que les 4 chevaux q (indices) soient les 4 premiers, ordre indifférent
+  let t = 0;
+  for (const a of q) for (const b of q) { if (b===a) continue;
+    for (const c of q) { if (c===a||c===b) continue;
+      const d = q.find(x => x!==a && x!==b && x!==c);
+      const r1 = 1-pv[a], r2 = r1-pv[b], r3 = r2-pv[c]; if (r3 <= 0) continue;
+      t += pv[a] * pv[b]/r1 * pv[c]/r2 * pv[d]/r3; }}
+  return t;
+}
+function marchePMU(P, srcs) {
+  const parSource = [P.map(c => c.coteDirect || c.coteMatin || null)];
+  for (const cotes of Object.values(srcs || {})) parSource.push(P.map(c => cotes[c.num] || null));
   const pm = P.map(() => []);
   for (const src of parSource) {
     const inv = src.map(v => v && v > 1 ? 1/v : 0); const s = inv.reduce((a,b)=>a+b,0);
     if (!s) continue; inv.forEach((v,i) => { if (v) pm[i].push(v/s); });
   }
-  let marche = pm.map(a => a.length ? a.reduce((x,y)=>x+y,0)/a.length : null);
-  const plancher = Math.min(...marche.filter(x => x !== null), 1/n) / 2;
-  marche = normaliser(marche.map(x => x === null ? plancher : x));
-
-  // 2) Mouvement : cote matin / cote direct (>1 = cote qui baisse = cheval joué)
+  let m = pm.map(a => a.length ? a.reduce((x,y)=>x+y,0)/a.length : null);
+  const connus = m.filter(x => x !== null);
+  const plancher = (connus.length ? Math.min(...connus) : 1/P.length) / 2;
+  return normaliser(m.map(x => x === null ? plancher : x));
+}
+function modele(P, w, srcs, complet) {
+  const n = P.length;
+  const marche = marchePMU(P, srcs);
   const mouv = normaliser(P.map((c,i) => {
     const f = c.coteMatin && c.coteDirect ? Math.min(2, Math.max(.5, c.coteMatin / c.coteDirect)) : 1;
-    return marche[i] * f;
-  }));
-  // 3) Forme
+    return marche[i] * f; }));
   const fr = P.map(c => scoreMusique(c.musique));
-  const moyF = (fr.filter(x => x !== null).reduce((a,b)=>a+b,0) / (fr.filter(x=>x!==null).length||1)) || .3;
+  const ok = fr.filter(x => x !== null);
+  const moyF = ok.length ? ok.reduce((a,b)=>a+b,0)/ok.length : .3;
   const forme = normaliser(fr.map(x => Math.pow(x === null ? moyF : x, 2)));
-  // 4) Régularité (places / courses, lissée vers 30 % pour les chevaux qui ont peu couru)
-  const rg = P.map(c => (c.places + 3*.3) / ((c.courses||0) + 3));
-  const regul = normaliser(rg.map(x => x*x));
-
-  const w = {M:+$("wM").value, T:+$("wT").value, F:+$("wF").value, R:+$("wR").value};
-  for (const k in w) $("v"+k).textContent = w[k];
+  const regul = normaliser(P.map(c => { const r = (c.places + .9) / ((c.courses||0) + 3); return r*r; }));
   const W = (w.M + w.T + w.F + w.R) || 1;
   const p = normaliser(P.map((_,i) => (w.M*marche[i] + w.T*mouv[i] + w.F*forme[i] + w.R*regul[i]) / W));
-
-  // Probabilités des groupes de 4 premiers (modèle de Harville)
   const idx = P.map((_,i) => i);
-  const quart = new Map(); const top4 = new Array(n).fill(0);
-  for (const a of idx) for (const b of idx) { if (b===a) continue;
-    for (const c of idx) { if (c===a||c===b) continue;
-      const r3 = 1 - p[a] - p[b] - p[c]; if (r3 <= 0) continue;
-      const base = p[a] * p[b]/(1-p[a]) * p[c]/(1-p[a]-p[b]) / r3;
-      for (const d of idx) { if (d===a||d===b||d===c) continue;
-        const pr = base * p[d];
-        const k = [a,b,c,d].sort((x,y)=>x-y).join(",");
-        quart.set(k, (quart.get(k)||0) + pr);
-        top4[a]+=pr; top4[b]+=pr; top4[c]+=pr; top4[d]+=pr;
-  }}}
-  const Q = [...quart].map(([k,v]) => [k.split(",").map(Number), v]);
 
-  // Meilleures sélections de 6 parmi les 11 chevaux les plus probables
+  // Proba d'être dans les 4 (tableau) : calcul complet seulement pour la course en direct
+  let top4 = null;
+  if (complet) {
+    top4 = new Array(n).fill(0);
+    for (const a of idx) for (const b of idx) { if (b===a) continue;
+      for (const c of idx) { if (c===a||c===b) continue;
+        const r3 = 1 - p[a] - p[b] - p[c]; if (r3 <= 0) continue;
+        const base = p[a] * p[b]/(1-p[a]) * p[c]/(1-p[a]-p[b]) / r3;
+        for (const d of idx) { if (d===a||d===b||d===c) continue;
+          const pr = base * p[d]; top4[a]+=pr; top4[b]+=pr; top4[c]+=pr; top4[d]+=pr; }}}
+  }
+  // Groupes de 4 parmi les 11 chevaux les plus probables
   const cand = idx.slice().sort((x,y) => p[y]-p[x]).slice(0, Math.min(11, n));
+  const Q = combinaisons(cand, 4).map(s => { const q = [...s]; return {q, key: q.slice().sort((a,b)=>a-b).join(","), p: harvilleQ(p, q)}; });
   const ensembles = combinaisons(cand, Math.min(6, n));
-  const couvre = (ens, q) => q.every(i => ens.has(i));
-  function meilleur(dejaCouverts, exclus) {
+  const couvre = (e, q) => q.every(i => e.has(i));
+  function meilleur(couverts, exclus) {
     let best = null, g = -1;
     for (const e of ensembles) { const key = [...e].sort((a,b)=>a-b).join(","); if (exclus.has(key)) continue;
-      let s = 0; for (const [q,v] of Q) if (!dejaCouverts.has(q.join(",")) && couvre(e,q)) s += v;
+      let s = 0; for (const x of Q) if (!couverts.has(x.key) && couvre(e, x.q)) s += x.p;
       if (s > g) { g = s; best = e; } }
     return [best, g];
   }
   const [t1, p1] = meilleur(new Set(), new Set());
+  const flexi = []; const couverts = new Set(), exclus = new Set();
+  for (let t = 0; t < 3; t++) {
+    const [e, g] = meilleur(couverts, exclus); if (!e) break;
+    exclus.add([...e].sort((a,b)=>a-b).join(","));
+    for (const x of Q) if (couvre(e, x.q)) couverts.add(x.key);
+    flexi.push({set: e, gain: g});
+  }
+  return {p, marche, fr, top4, Q, t1, p1, flexi, couvre};
+}
+
+// Rapport estimé du Multi en 6 (pour 3 €) si les 4 premiers sont q :
+// en pari mutuel, rapport ≈ K × mise / (15 × proba du marché) ; K est calé sur les vrais rapports des jours passés.
+let K = 1.0, Kfiable = false;
+const rapportEstime = (m, x) => K * 3 / (15 * Math.max(harvilleQ(m.marche, x.q), 1e-6));
+function esperance(m, ens, mise, facteur) {
+  let ret = 0, pw = 0, mini = Infinity, maxi = 0;
+  for (const x of m.Q) if (m.couvre(ens, x.q)) {
+    const r = rapportEstime(m, x) * facteur; ret += x.p * r; pw += x.p;
+    if (x.p > 0.001) { mini = Math.min(mini, r); maxi = Math.max(maxi, r); } }
+  return {ret, net: ret - mise, ratio: ret / mise, siGagne: pw ? ret / pw : 0, mini, maxi};
+}
+const poids = () => ({M:+$("wM").value, T:+$("wT").value, F:+$("wF").value, R:+$("wR").value});
+
+function calculer() {
+  if (!donnees) return;
+  const tous = donnees.partants;
+  const P = tous.filter(c => c.partant);
+  const n = P.length;
+  if (n < 6) { $("tNums").textContent = "Pas assez de partants."; return; }
+  const w = poids(); for (const k in w) $("v"+k).textContent = w[k];
+  const m = modele(P, w, sources, true);
+  const {p, fr, top4, t1, p1} = m;
 
   // Ticket principal
   const ordre6 = [...t1].sort((a,b) => p[b]-p[a]);
   $("tNums").innerHTML = ordre6.map(i => `<span class="n">${P[i].num}</span>`).join("");
   $("tProba").textContent = pct(p1);
   $("tChance").textContent = "1 chance sur " + Math.round(1/p1);
-  $("tSeuil").textContent = euro(3/p1);
+  const e1 = esperance(m, t1, 3, 1);
+  $("tRapport").textContent = "≈ " + euro(e1.siGagne);
+  $("tRapportDet").textContent = isFinite(e1.mini) ? `de ${euro(e1.mini)} à ${euro(e1.maxi)} selon l'arrivée` : "";
+  verdict(e1, "v1");
   $("copier").dataset.txt = ordre6.map(i => P[i].num).join(" - ");
 
-  // Flexi : 3 tickets choisis pour se compléter
-  const couverts = new Set(), exclus = new Set(); let total = 0; let html = "";
-  for (let t = 0; t < 3; t++) {
-    const [e, g] = meilleur(couverts, exclus); if (!e) break;
-    const key = [...e].sort((a,b)=>a-b).join(","); exclus.add(key);
-    for (const [q] of Q) if (couvre(e,q)) couverts.add(q.join(","));
-    total += g;
-    const o = [...e].sort((a,b) => p[b]-p[a]);
-    html += `<div class="row">${o.map(i => `<span class="n small" style="display:inline-grid;place-items:center;width:34px;height:34px;border-radius:7px;background:var(--turf);color:var(--surface);font-weight:700">${P[i].num}</span>`).join("")}<em>+${pct(g)}</em></div>`;
+  // Flexi : 3 tickets qui se complètent, chaque ticket gagnant paie la moitié du rapport
+  let total = 0, retF = 0, html = "";
+  for (const t of m.flexi) {
+    total += t.gain; retF += esperance(m, t.set, 1.5, 0.5).ret;
+    const o = [...t.set].sort((a,b) => p[b]-p[a]);
+    html += `<div class="row">${o.map(i => `<span class="n small">${P[i].num}</span>`).join("")}<em>+${pct(t.gain)}</em></div>`;
   }
   $("fTickets").innerHTML = html;
-  $("fTotal").textContent = `Ensemble : ${pct(total)} de chances d'avoir un ticket gagnant (1 sur ${Math.round(1/total)}). Rapport mini par ticket : ${euro(4.5/total)} pour 1,50 €.`;
+  $("fTotal").textContent = `Ensemble : ${pct(total)} de chances d'avoir au moins un ticket gagnant (1 sur ${Math.round(1/total)}). Gain moyen attendu : ${signe(retF - 4.5)} pour 4,50 €.`;
 
   // Tableau
+  const idx = P.map((_,i) => i);
   const ordre = idx.slice().sort((x,y) => p[y]-p[x]);
   const maxT = Math.max(...top4);
   const lignes = ordre.map(i => {
@@ -620,10 +792,79 @@ function calculer() {
   const arr = donnees.arrivee || [];
   if (arr.length >= 4) {
     const nums6 = new Set(ordre6.map(i => P[i].num));
-    const ok = arr.every(x => nums6.has(x));
+    const gagne = arr.every(x => nums6.has(x));
     $("resultat").hidden = false;
-    $("resultat").textContent = `Arrivée : ${arr.join(" - ")}. Le ticket conseillé était ${ok ? "GAGNANT" : "perdant"}.`;
+    $("resultat").textContent = `Arrivée : ${arr.join(" - ")}. Le ticket conseillé était ${gagne ? "GAGNANT" : "perdant"}.`;
   } else $("resultat").hidden = true;
+}
+
+const signe = x => (x >= 0 ? "+" : "−") + euro(Math.abs(x));
+function verdict(e, id) {
+  const el = $(id);
+  let cls, titre;
+  if (e.ratio >= 1.0) { cls = "ok"; titre = "Pari favorable"; }
+  else if (e.ratio >= 0.85) { cls = "mid"; titre = "Pari limite"; }
+  else { cls = "ko"; titre = "Pari défavorable : passe ton tour"; }
+  el.className = "verdict " + cls;
+  el.innerHTML = `<b>${titre}</b><span>Gain moyen attendu : ${signe(e.net)} pour 3 € misés (${Math.round(e.ratio*100)} % de la mise rendue en moyenne)${Kfiable ? "" : " · estimation provisoire, en attente du bilan"}</span>`;
+}
+
+// ---------- bilan des jours passés
+let bilanData = null, bilanTimer = null;
+async function chargerBilan() {
+  $("bEtat").textContent = "Calcul du bilan sur les 30 derniers jours… (jusqu'à 30 secondes la première fois)";
+  try {
+    const r = await fetch(`/api/bilan?jours=30&heure=${HEURE_CIBLE}`); const j = await r.json();
+    if (!r.ok) throw new Error(j.erreur || "Bilan indisponible");
+    bilanData = j.courses;
+    calerK(); calculerBilan(); calculer();
+  } catch (e) { $("bEtat").textContent = "Bilan indisponible : " + e.message + ". Il sera recalculé à la prochaine ouverture."; }
+}
+function calerK() {
+  const ratios = [];
+  for (const j of bilanData || []) {
+    const P = j.partants.filter(c => c.partant);
+    const pos = j.arrivee.map(nm => P.findIndex(c => c.num === nm));
+    const en6 = j.rapports.en6; if (!en6 || pos.some(x => x < 0)) continue;
+    const pq = harvilleQ(marchePMU(P, {}), pos); if (pq <= 0) continue;
+    ratios.push((en6 * 3 / j.rapports.mise) / (3 / (15 * pq)));
+  }
+  if (ratios.length >= 5) { ratios.sort((a,b)=>a-b); K = ratios[Math.floor(ratios.length/2)]; Kfiable = true; }
+}
+function calculerBilan() {
+  if (!bilanData) return;
+  const w = poids();
+  const st = {a: {n:0, g:0, mise:0, ret:0}, f: {n:0, g:0, mise:0, ret:0}, fav: {n:0, g:0, mise:0, ret:0}};
+  const lignes = [];
+  for (const j of bilanData) {
+    const P = j.partants.filter(c => c.partant);
+    if (P.length < 6 || !j.rapports.en6) continue;
+    const en6 = j.rapports.en6 * 3 / j.rapports.mise;           // rapport pour 3 €
+    const arr = j.arrivee;
+    const m = modele(P, w, {}, false);
+    const nums = s => new Set([...s].map(i => P[i].num));
+    const dedans = s => arr.every(x => s.has(x));
+    const okA = dedans(nums(m.t1));
+    st.a.n++; st.a.mise += 3; if (okA) { st.a.g++; st.a.ret += en6; }
+    let gF = 0; for (const t of m.flexi) if (dedans(nums(t.set))) gF += en6 / 2;
+    st.f.n++; st.f.mise += 1.5 * m.flexi.length; if (gF) { st.f.g++; st.f.ret += gF; }
+    const fav = new Set(P.slice().sort((x,y) => (x.coteDirect||999) - (y.coteDirect||999)).slice(0, 6).map(c => c.num));
+    const okF = dedans(fav);
+    st.fav.n++; st.fav.mise += 3; if (okF) { st.fav.g++; st.fav.ret += en6; }
+    const d = j.date;
+    lignes.push(`<tr><td class="l">${d.slice(0,2)}/${d.slice(2,4)}</td><td class="l">${esc(j.hippodrome)} R${j.r}C${j.c}</td>
+      <td class="l">${arr.join("-")}</td><td>${euro(en6)}</td>
+      <td class="${okA?"tr-down":""}">${okA?"✓ +"+euro(en6):"✗"}</td><td class="${gF?"tr-down":""}">${gF?"✓ +"+euro(gF):"✗"}</td><td class="${okF?"tr-down":""}">${okF?"✓":"✗"}</td></tr>`);
+  }
+  const carte = (t, s, sous) => `<div class="bcard"><h3>${t}</h3><div class="sub">${sous}</div>
+      <div class="bnet ${s.ret - s.mise >= 0 ? "tr-down" : "tr-up"}">${signe(s.ret - s.mise)}</div>
+      <div class="sub">${s.g} gagnant${s.g>1?"s":""} sur ${s.n} · misé ${euro(s.mise)} · récupéré ${euro(s.ret)}</div></div>`;
+  $("bCartes").innerHTML = carte("Ticket de l'appli", st.a, "1 ticket à 3 € par jour") +
+    carte("Appli en Flexi", st.f, "3 tickets à 1,50 € par jour") + carte("Les 6 favoris", st.fav, "1 ticket à 3 € sur les 6 plus petites cotes");
+  $("bCorps").innerHTML = lignes.join("");
+  $("bEtat").textContent = st.a.n
+    ? `${st.a.n} courses analysées (la course Multi la plus proche de ${HEURE_CIBLE.replace(":", "h")} chaque jour), avec les réglages actuels. Calcul fait avec les cotes finales : en vrai, à 13h52, c'est un peu moins bon.`
+    : "Aucune course exploitable sur la période.";
 }
 
 function combinaisons(arr, k) {
@@ -643,7 +884,8 @@ function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&l
 
 // ---------- réglages
 for (const k of ["wM","wT","wF","wR"]) $(k).addEventListener("input", e => {
-  try { localStorage.setItem("ml_"+k, e.target.value); } catch(_) {} calculer(); });
+  try { localStorage.setItem("ml_"+k, e.target.value); } catch(_) {} calculer();
+  clearTimeout(bilanTimer); bilanTimer = setTimeout(calculerBilan, 400); });
 
 $("copier").addEventListener("click", async e => {
   const t = e.target.dataset.txt || "";
@@ -673,6 +915,7 @@ $("srcAjout").addEventListener("click", () => {
 afficherSources();
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
+chargerBilan();
 chargerProgramme().catch(e => {
   $("erreur").hidden = false; $("erreur").textContent = e.message + ". Rechargement dans 30 s.";
   etat(false, "Hors ligne"); $("cNom").textContent = "Programme indisponible";
