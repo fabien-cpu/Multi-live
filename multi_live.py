@@ -469,6 +469,11 @@ svg.spark{vertical-align:middle}
 .verdict.mid{border-color:var(--warn);background:color-mix(in srgb,var(--warn) 12%,transparent)} .verdict.mid b{color:var(--warn)}
 .verdict.ko{border-color:var(--up);background:color-mix(in srgb,var(--up) 10%,transparent)} .verdict.ko b{color:var(--up)}
 .bilan{margin-top:16px}
+.monpari{display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;margin-bottom:6px}
+.monpari label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.miseBox{display:inline-flex;align-items:center;gap:4px;font-weight:600}
+.miseBox input{width:80px;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;color:inherit}
+#miseAide{margin:0 0 10px}
 .bcartes{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-top:10px}
 .bcard{border:1px solid var(--line);border-radius:8px;padding:12px;display:grid;gap:4px;min-width:0}
 .bcard h3{margin:0;font-size:14px}
@@ -496,7 +501,14 @@ table.btab{min-width:560px}
 
 <div class="grid">
   <section class="panel ticket">
-    <h2 id="tTitre">Ticket conseillé — Multi en 6, mise 3 €</h2>
+    <div class="monpari">
+      <label for="formule">Formule</label>
+      <select id="formule"><option value="4">Multi en 4</option><option value="5">Multi en 5</option><option value="6" selected>Multi en 6</option><option value="7">Multi en 7</option></select>
+      <label for="mise">Ma mise</label>
+      <span class="miseBox"><input id="mise" type="number" inputmode="decimal" min="1.5" max="60" step="0.5" value="5"> €</span>
+    </div>
+    <p class="sub" id="miseAide"></p>
+    <h2 id="tTitre">Ticket conseillé</h2>
     <div class="nums" id="tNums"></div>
     <div class="kpis">
       <div class="kpi"><b id="tProba">–</b><span>chance que les 4 premiers soient dedans</span></div>
@@ -506,11 +518,11 @@ table.btab{min-width:560px}
     <div id="v1" class="verdict"></div>
     <button class="copie" id="copier" type="button">Copier les numéros</button>
     <div class="flexi">
-      <h2>Variante Flexi 50 % — 3 tickets à 1,50 € = 4,50 €</h2>
+      <h2 id="fTitre">Variante : ta mise répartie sur 3 tickets</h2>
       <div id="fTickets"></div>
       <p class="note" id="fTotal"></p>
     </div>
-    <p class="note">Le rapport estimé vient des cotes, calé sur les vrais rapports du Multi des 30 derniers jours. Le verdict ne vaut que si le bilan ci-dessous montre que l'appli fait mieux que les favoris.</p>
+    <p class="note">Le rapport estimé vient des cotes, calé sur les vrais rapports du Multi des 30 derniers jours, puis ajusté à ta mise (rapport PMU pour 3 € × ta mise ÷ 3). Le verdict ne vaut que si le bilan ci-dessous montre que l'appli fait mieux que les favoris.</p>
   </section>
 
   <section class="panel">
@@ -541,7 +553,7 @@ table.btab{min-width:560px}
   <p class="sub" id="bEtat">Chargement…</p>
   <div class="bcartes" id="bCartes"></div>
   <details><summary>Détail jour par jour</summary>
-    <div class="tablewrap"><table class="btab"><thead><tr><th class="l">Jour</th><th class="l">Course</th><th class="l">Arrivée</th><th>Multi en 6</th><th>Appli</th><th>Flexi</th><th>Favoris</th></tr></thead><tbody id="bCorps"></tbody></table></div>
+    <div class="tablewrap"><table class="btab"><thead><tr><th class="l">Jour</th><th class="l">Course</th><th class="l">Arrivée</th><th id="bColRap">Rapport</th><th>Appli</th><th>3 tickets</th><th>Favoris</th></tr></thead><tbody id="bCorps"></tbody></table></div>
   </details>
 </section>
 
@@ -563,6 +575,11 @@ table.btab{min-width:560px}
 const $ = id => document.getElementById(id);
 const HEURE_CIBLE = "13:55";
 let courses = [], courant = null, donnees = null, timer = null, sources = {};
+const NB_GROUPES = {4: 1, 5: 5, 6: 15, 7: 35};   // le rapport en k = rapport en 4 ÷ nombre de groupes de 4 couverts
+function formule() { return +$("formule").value; }
+function maMise() { let v = parseFloat(String($("mise").value).replace(",", ".")); if (!isFinite(v)) v = 3; return Math.min(60, Math.max(1.5, v)); }
+try { const f = localStorage.getItem("ml_formule"); if (f) $("formule").value = f;
+      const mi = localStorage.getItem("ml_mise"); if (mi) $("mise").value = mi; } catch(e) {}
 try { sources = JSON.parse(localStorage.getItem("ml_sources") || "{}"); } catch(e) {}
 for (const k of ["wM","wT","wF","wR"]) { try { const v = localStorage.getItem("ml_"+k); if (v !== null) $(k).value = v; } catch(e) {} }
 
@@ -672,7 +689,8 @@ function marchePMU(P, srcs) {
   const plancher = (connus.length ? Math.min(...connus) : 1/P.length) / 2;
   return normaliser(m.map(x => x === null ? plancher : x));
 }
-function modele(P, w, srcs, complet) {
+function modele(P, w, srcs, complet, k) {
+  k = k || 6;
   const n = P.length;
   const marche = marchePMU(P, srcs);
   const mouv = normaliser(P.map((c,i) => {
@@ -701,7 +719,7 @@ function modele(P, w, srcs, complet) {
   // Groupes de 4 parmi les 11 chevaux les plus probables
   const cand = idx.slice().sort((x,y) => p[y]-p[x]).slice(0, Math.min(11, n));
   const Q = combinaisons(cand, 4).map(s => { const q = [...s]; return {q, key: q.slice().sort((a,b)=>a-b).join(","), p: harvilleQ(p, q)}; });
-  const ensembles = combinaisons(cand, Math.min(6, n));
+  const ensembles = combinaisons(cand, Math.min(k, n));
   const couvre = (e, q) => q.every(i => e.has(i));
   function meilleur(couverts, exclus) {
     let best = null, g = -1;
@@ -721,14 +739,14 @@ function modele(P, w, srcs, complet) {
   return {p, marche, fr, top4, Q, t1, p1, flexi, couvre};
 }
 
-// Rapport estimé du Multi en 6 (pour 3 €) si les 4 premiers sont q :
-// en pari mutuel, rapport ≈ K × mise / (15 × proba du marché) ; K est calé sur les vrais rapports des jours passés.
+// Rapport estimé (pour 1 €) du Multi en k si les 4 premiers sont q :
+// en pari mutuel, rapport ≈ K / (nombre de groupes couverts × proba du marché) ; K est calé sur les vrais rapports passés.
 let K = 1.0, Kfiable = false;
-const rapportEstime = (m, x) => K * 3 / (15 * Math.max(harvilleQ(m.marche, x.q), 1e-6));
-function esperance(m, ens, mise, facteur) {
+const rapportEstime = (m, x, k) => K / (NB_GROUPES[k] * Math.max(harvilleQ(m.marche, x.q), 1e-6));
+function esperance(m, ens, mise, k) {
   let ret = 0, pw = 0, mini = Infinity, maxi = 0;
   for (const x of m.Q) if (m.couvre(ens, x.q)) {
-    const r = rapportEstime(m, x) * facteur; ret += x.p * r; pw += x.p;
+    const r = rapportEstime(m, x, k) * mise; ret += x.p * r; pw += x.p;
     if (x.p > 0.001) { mini = Math.min(mini, r); maxi = Math.max(maxi, r); } }
   return {ret, net: ret - mise, ratio: ret / mise, siGagne: pw ? ret / pw : 0, mini, maxi};
 }
@@ -739,31 +757,37 @@ function calculer() {
   const tous = donnees.partants;
   const P = tous.filter(c => c.partant);
   const n = P.length;
-  if (n < 6) { $("tNums").textContent = "Pas assez de partants."; return; }
-  const w = poids(); for (const k in w) $("v"+k).textContent = w[k];
-  const m = modele(P, w, sources, true);
+  const k = formule(), mise = maMise();
+  if (n < k) { $("tNums").textContent = "Pas assez de partants."; return; }
+  const w = poids(); for (const kk in w) $("v"+kk).textContent = w[kk];
+  const m = modele(P, w, sources, true, k);
   const {p, fr, top4, t1, p1} = m;
+  $("tTitre").textContent = `Ticket conseillé — Multi en ${k}, mise ${euro(mise)}` +
+    (courant && courant.multi === "Mini Multi" && k === 7 ? " (attention : le Mini Multi ne se joue pas en 7)" : "");
+  $("miseAide").textContent = `Ton gain = rapport PMU pour 3 € × ${(mise/3).toFixed(2).replace(".", ",")}. Mise possible de 1,50 € à 60 € par ticket.`;
 
   // Ticket principal
   const ordre6 = [...t1].sort((a,b) => p[b]-p[a]);
   $("tNums").innerHTML = ordre6.map(i => `<span class="n">${P[i].num}</span>`).join("");
   $("tProba").textContent = pct(p1);
   $("tChance").textContent = "1 chance sur " + Math.round(1/p1);
-  const e1 = esperance(m, t1, 3, 1);
+  const e1 = esperance(m, t1, mise, k);
   $("tRapport").textContent = "≈ " + euro(e1.siGagne);
   $("tRapportDet").textContent = isFinite(e1.mini) ? `de ${euro(e1.mini)} à ${euro(e1.maxi)} selon l'arrivée` : "";
-  verdict(e1, "v1");
+  verdict(e1, "v1", mise);
   $("copier").dataset.txt = ordre6.map(i => P[i].num).join(" - ");
 
-  // Flexi : 3 tickets qui se complètent, chaque ticket gagnant paie la moitié du rapport
+  // Variante : la mise répartie sur 3 tickets qui se complètent (chacun au minimum 1,50 €)
+  const miseT = Math.floor(mise / 3 * 100) / 100;
   let total = 0, retF = 0, html = "";
-  for (const t of m.flexi) {
-    total += t.gain; retF += esperance(m, t.set, 1.5, 0.5).ret;
+  $("fTitre").textContent = miseT >= 1.5 ? `Variante : 3 tickets à ${euro(miseT)} = ${euro(3*miseT)}` : "Variante 3 tickets : il faut au moins 4,50 € (1,50 € par ticket)";
+  for (const t of (miseT >= 1.5 ? m.flexi : [])) {
+    total += t.gain; retF += esperance(m, t.set, miseT, k).ret;
     const o = [...t.set].sort((a,b) => p[b]-p[a]);
     html += `<div class="row">${o.map(i => `<span class="n small">${P[i].num}</span>`).join("")}<em>+${pct(t.gain)}</em></div>`;
   }
   $("fTickets").innerHTML = html;
-  $("fTotal").textContent = `Ensemble : ${pct(total)} de chances d'avoir au moins un ticket gagnant (1 sur ${Math.round(1/total)}). Gain moyen attendu : ${signe(retF - 4.5)} pour 4,50 €.`;
+  $("fTotal").textContent = total ? `Ensemble : ${pct(total)} de chances d'avoir au moins un ticket gagnant (1 sur ${Math.round(1/total)}). Gain moyen attendu : ${signe(retF - 3*miseT)} pour ${euro(3*miseT)}.` : "";
 
   // Tableau
   const idx = P.map((_,i) => i);
@@ -799,14 +823,14 @@ function calculer() {
 }
 
 const signe = x => (x >= 0 ? "+" : "−") + euro(Math.abs(x));
-function verdict(e, id) {
+function verdict(e, id, mise) {
   const el = $(id);
   let cls, titre;
   if (e.ratio >= 1.0) { cls = "ok"; titre = "Pari favorable"; }
   else if (e.ratio >= 0.85) { cls = "mid"; titre = "Pari limite"; }
   else { cls = "ko"; titre = "Pari défavorable : passe ton tour"; }
   el.className = "verdict " + cls;
-  el.innerHTML = `<b>${titre}</b><span>Gain moyen attendu : ${signe(e.net)} pour 3 € misés (${Math.round(e.ratio*100)} % de la mise rendue en moyenne)${Kfiable ? "" : " · estimation provisoire, en attente du bilan"}</span>`;
+  el.innerHTML = `<b>${titre}</b><span>Gain moyen attendu : ${signe(e.net)} pour ${euro(mise)} misés (${Math.round(e.ratio*100)} % de la mise rendue en moyenne)${Kfiable ? "" : " · estimation provisoire, en attente du bilan"}</span>`;
 }
 
 // ---------- bilan des jours passés
@@ -825,46 +849,51 @@ function calerK() {
   for (const j of bilanData || []) {
     const P = j.partants.filter(c => c.partant);
     const pos = j.arrivee.map(nm => P.findIndex(c => c.num === nm));
-    const en6 = j.rapports.en6; if (!en6 || pos.some(x => x < 0)) continue;
+    const en4 = j.rapports.en4 || (j.rapports.en6 ? j.rapports.en6 * 15 : 0);
+    if (!en4 || pos.some(x => x < 0)) continue;
     const pq = harvilleQ(marchePMU(P, {}), pos); if (pq <= 0) continue;
-    ratios.push((en6 * 3 / j.rapports.mise) / (3 / (15 * pq)));
+    ratios.push((en4 / j.rapports.mise) * pq);          // rapport réel pour 1 € ÷ rapport « juste » (1 / proba)
   }
   if (ratios.length >= 5) { ratios.sort((a,b)=>a-b); K = ratios[Math.floor(ratios.length/2)]; Kfiable = true; }
 }
 function calculerBilan() {
   if (!bilanData) return;
-  const w = poids();
+  const w = poids(), k = formule(), mise = maMise(), miseT = Math.floor(mise / 3 * 100) / 100;
   const st = {a: {n:0, g:0, mise:0, ret:0}, f: {n:0, g:0, mise:0, ret:0}, fav: {n:0, g:0, mise:0, ret:0}};
   const lignes = [];
   for (const j of bilanData) {
     const P = j.partants.filter(c => c.partant);
-    if (P.length < 6 || !j.rapports.en6) continue;
-    const en6 = j.rapports.en6 * 3 / j.rapports.mise;           // rapport pour 3 €
+    const rk = j.rapports["en" + k];
+    if (P.length < k + 2 || !rk) continue;
+    const r1 = rk / j.rapports.mise;                    // rapport pour 1 €
     const arr = j.arrivee;
-    const m = modele(P, w, {}, false);
+    const m = modele(P, w, {}, false, k);
     const nums = s => new Set([...s].map(i => P[i].num));
     const dedans = s => arr.every(x => s.has(x));
     const okA = dedans(nums(m.t1));
-    st.a.n++; st.a.mise += 3; if (okA) { st.a.g++; st.a.ret += en6; }
-    let gF = 0; for (const t of m.flexi) if (dedans(nums(t.set))) gF += en6 / 2;
-    st.f.n++; st.f.mise += 1.5 * m.flexi.length; if (gF) { st.f.g++; st.f.ret += gF; }
-    const fav = new Set(P.slice().sort((x,y) => (x.coteDirect||999) - (y.coteDirect||999)).slice(0, 6).map(c => c.num));
+    st.a.n++; st.a.mise += mise; if (okA) { st.a.g++; st.a.ret += r1 * mise; }
+    let gF = 0;
+    if (miseT >= 1.5) { for (const t of m.flexi) if (dedans(nums(t.set))) gF += r1 * miseT;
+      st.f.n++; st.f.mise += miseT * m.flexi.length; if (gF) { st.f.g++; st.f.ret += gF; } }
+    const fav = new Set(P.slice().sort((x,y) => (x.coteDirect||999) - (y.coteDirect||999)).slice(0, k).map(c => c.num));
     const okF = dedans(fav);
-    st.fav.n++; st.fav.mise += 3; if (okF) { st.fav.g++; st.fav.ret += en6; }
+    st.fav.n++; st.fav.mise += mise; if (okF) { st.fav.g++; st.fav.ret += r1 * mise; }
     const d = j.date;
     lignes.push(`<tr><td class="l">${d.slice(0,2)}/${d.slice(2,4)}</td><td class="l">${esc(j.hippodrome)} R${j.r}C${j.c}</td>
-      <td class="l">${arr.join("-")}</td><td>${euro(en6)}</td>
-      <td class="${okA?"tr-down":""}">${okA?"✓ +"+euro(en6):"✗"}</td><td class="${gF?"tr-down":""}">${gF?"✓ +"+euro(gF):"✗"}</td><td class="${okF?"tr-down":""}">${okF?"✓":"✗"}</td></tr>`);
+      <td class="l">${arr.join("-")}</td><td>${euro(r1 * mise)}</td>
+      <td class="${okA?"tr-down":""}">${okA?"✓ +"+euro(r1*mise):"✗"}</td><td class="${gF?"tr-down":""}">${gF?"✓ +"+euro(gF):"✗"}</td><td class="${okF?"tr-down":""}">${okF?"✓":"✗"}</td></tr>`);
   }
+  $("bColRap").textContent = `Rapport (${euro(mise)})`;
   const carte = (t, s, sous) => `<div class="bcard"><h3>${t}</h3><div class="sub">${sous}</div>
       <div class="bnet ${s.ret - s.mise >= 0 ? "tr-down" : "tr-up"}">${signe(s.ret - s.mise)}</div>
       <div class="sub">${s.g} gagnant${s.g>1?"s":""} sur ${s.n} · misé ${euro(s.mise)} · récupéré ${euro(s.ret)}</div></div>`;
-  $("bCartes").innerHTML = carte("Ticket de l'appli", st.a, "1 ticket à 3 € par jour") +
-    carte("Appli en Flexi", st.f, "3 tickets à 1,50 € par jour") + carte("Les 6 favoris", st.fav, "1 ticket à 3 € sur les 6 plus petites cotes");
+  $("bCartes").innerHTML = carte("Ticket de l'appli", st.a, `Multi en ${k}, 1 ticket à ${euro(mise)} par jour`) +
+    (miseT >= 1.5 ? carte("Mise répartie", st.f, `3 tickets à ${euro(miseT)} par jour`) : "") +
+    carte(`Les ${k} favoris`, st.fav, `1 ticket à ${euro(mise)} sur les ${k} plus petites cotes`);
   $("bCorps").innerHTML = lignes.join("");
   $("bEtat").textContent = st.a.n
-    ? `${st.a.n} courses analysées (la course Multi la plus proche de ${HEURE_CIBLE.replace(":", "h")} chaque jour), avec les réglages actuels. Calcul fait avec les cotes finales : en vrai, à 13h52, c'est un peu moins bon.`
-    : "Aucune course exploitable sur la période.";
+    ? `${st.a.n} courses analysées (la course Multi la plus proche de ${HEURE_CIBLE.replace(":", "h")} chaque jour), avec la formule, la mise et les réglages actuels. Calcul fait avec les cotes finales : en vrai, à 13h52, c'est un peu moins bon.`
+    : (k === 7 ? "Pas de rapport Multi en 7 sur la période (les Mini Multi ne se jouent pas en 7)." : "Aucune course exploitable sur la période.");
 }
 
 function combinaisons(arr, k) {
@@ -886,6 +915,10 @@ function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&l
 for (const k of ["wM","wT","wF","wR"]) $(k).addEventListener("input", e => {
   try { localStorage.setItem("ml_"+k, e.target.value); } catch(_) {} calculer();
   clearTimeout(bilanTimer); bilanTimer = setTimeout(calculerBilan, 400); });
+
+for (const id of ["formule", "mise"]) $(id).addEventListener(id === "mise" ? "input" : "change", () => {
+  try { localStorage.setItem("ml_" + id, $(id).value); } catch(_) {}
+  calculer(); clearTimeout(bilanTimer); bilanTimer = setTimeout(calculerBilan, 400); });
 
 $("copier").addEventListener("click", async e => {
   const t = e.target.dataset.txt || "";
