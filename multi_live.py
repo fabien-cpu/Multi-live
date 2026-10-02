@@ -676,6 +676,13 @@ header{align-items:center}
 .ticket .nums.ord .n{height:56px;align-content:center;line-height:1.1}
 .ticket .n i{display:block;font-style:normal;font-size:10px;font-weight:600;opacity:.85}
 .reglages{margin-top:16px}
+.tk{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
+.tk:last-child{border-bottom:0}
+.tk .lab{flex:0 0 100%;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.tk .lab b{color:var(--ink);text-transform:none;letter-spacing:0;font-size:12px;margin-left:6px}
+.ticket .nums.plusieurs{display:block;margin:0 0 10px}
+.ticket .nums.plusieurs .n{width:40px;height:40px;font-size:17px}
+.ticket .nums.plusieurs.ord .n{height:50px}
 .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px;width:230px;max-width:60vw}
 .tag{font-size:11px;padding:1px 6px;border-radius:99px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
 .tag.plus{border-color:var(--down);color:var(--down)} .tag.moins{border-color:var(--up);color:var(--up)}
@@ -702,7 +709,9 @@ table.btab{min-width:620px}
     <select id="style"><option value="prudent">Prudent</option><option value="equilibre">Équilibré</option><option value="outsiders">Outsiders</option></select></div>
   <div class="champ" id="formuleBox" hidden><label for="formule">Formule</label>
     <select id="formule"><option value="4">en 4</option><option value="5">en 5</option><option value="6" selected>en 6</option><option value="7">en 7</option></select></div>
-  <div class="champ"><label for="mise">Ma mise</label>
+  <div class="champ"><label for="nbt">Tickets</label>
+    <select id="nbt"><option value="1">1 ticket</option><option value="2">2 tickets</option><option value="3">3 tickets</option><option value="4">4 tickets</option><option value="5">5 tickets</option></select></div>
+  <div class="champ"><label for="mise">Mise par ticket</label>
     <span class="miseBox"><input id="mise" type="number" inputmode="decimal" min="1" max="60" step="0.5" value="5"> €</span></div>
 </div>
 
@@ -725,11 +734,6 @@ table.btab{min-width:620px}
   </div>
   <div id="v1" class="verdict"></div>
   <button class="copie" id="copier" type="button">Copier les numéros</button>
-  <div class="flexi" id="varBox" hidden>
-    <h2 id="fTitre">Variante : ta mise répartie sur 3 tickets</h2>
-    <div id="fTickets"></div>
-    <p class="note" id="fTotal"></p>
-  </div>
   <div class="flexi">
     <h2>Outsiders à surveiller</h2>
     <div id="outListe"></div>
@@ -828,6 +832,7 @@ try {
   const f = localStorage.getItem("ml_formule"); if (f) $("formule").value = f;
   const mi = localStorage.getItem("ml_mise"); if (mi) $("mise").value = mi;
   const pp = localStorage.getItem("ml_pari"); if (pp && PARIS[pp]) prefPari = pp;
+  const nt = localStorage.getItem("ml_nbt"); if (nt) $("nbt").value = nt;
   const sy = localStorage.getItem("ml_style"); if (sy && STYLES[sy]) { style = sy; $("style").value = sy; }
 } catch (e) {}
 pari = prefPari;
@@ -839,6 +844,7 @@ const signe = x => (x >= 0 ? "+" : "−") + euro(Math.abs(x));
 const sur = p => p > 0 ? "1 chance sur " + Math.max(1, Math.round(1 / p)).toLocaleString("fr-FR") : "–";
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c])); }
 function formule() { return +$("formule").value; }
+function nbTickets() { return Math.max(1, Math.min(5, +$("nbt").value || 1)); }
 function maMise() { let v = parseFloat(String($("mise").value).replace(",", ".")); if (!isFinite(v)) v = 3; return Math.min(60, Math.max(1, v)); }
 const CURSEURS = ["wM", "wT", "wF", "wR", "wA", "wS"];
 const poids = () => ({M: +$("wM").value, T: +$("wT").value, F: +$("wF").value, R: +$("wR").value, A: +$("wA").value, S: +$("wS").value});
@@ -1097,17 +1103,17 @@ function choisirTicket(mod, k, sty) {
 }
 function quartets(T) { return combinaisons(T, 4).map(s => [...s]); }
 function couvertureMulti(p, T) { let t = 0; for (const q of quartets(T)) t += setP(p, q); return t; }
-// Variante Multi : le ticket principal, plus 2 tickets qui couvrent le mieux ce qu'il laisse de côté
-function troisTickets(p, k, T1) {
+// Multi : le ticket principal, puis les tickets qui couvrent le mieux ce que les précédents laissent de côté
+function ticketsMulti(p, k, T1, N) {
   const n = p.length, idx = p.map((_, i) => i);
   const cand = [...new Set(idx.slice().sort((x, y) => p[y] - p[x]).slice(0, Math.min(11, n)).concat(T1))];
   const Q = combinaisons(cand, 4).map(e => { const q = [...e]; return {q, key: q.slice().sort((a, b) => a - b).join(","), p: setP(p, q)}; });
   const ensembles = combinaisons(cand, Math.min(k, n)), couvre = (e, q) => q.every(i => e.has(i));
   const couverts = new Set(), exclus = new Set(), out = [];
   const ajouter = e => { let g = 0; for (const x of Q) if (!couverts.has(x.key) && couvre(e, x.q)) { g += x.p; couverts.add(x.key); }
-    exclus.add([...e].sort((a, b) => a - b).join(",")); out.push({set: e, gain: g}); };
+    exclus.add([...e].sort((a, b) => a - b).join(",")); out.push({T: [...e].sort((a, b) => p[b] - p[a]), plus: g}); };
   ajouter(new Set(T1));
-  for (let t = 0; t < 2; t++) {
+  while (out.length < N) {
     let best = null, g = -1;
     for (const e of ensembles) { if (exclus.has([...e].sort((a, b) => a - b).join(","))) continue;
       let v = 0; for (const x of Q) if (!couverts.has(x.key) && couvre(e, x.q)) v += x.p;
@@ -1115,6 +1121,36 @@ function troisTickets(p, k, T1) {
     if (!best) break; ajouter(best);
   }
   return out;
+}
+function auMoinsUn(pv, tickets, m) {    // paris « placés » : proba qu'au moins un des tickets soit en entier dans les m premiers
+  const n = pv.length, used = new Array(n).fill(false), pos = []; let tot = 0;
+  (function rec(depth, prob, reste) {
+    if (depth === m || reste <= 1e-12) { if (tickets.some(T => T.every(i => used[i]))) tot += prob; return; }
+    for (let i = 0; i < n; i++) if (!used[i]) { used[i] = true; rec(depth + 1, prob * pv[i] / reste, reste - pv[i]); used[i] = false; }
+  })(0, 1, 1);
+  return tot;
+}
+// Liste de N tickets : le premier suit le style choisi, les suivants sont les combinaisons les plus probables restantes.
+// Renvoie [{T: indices, plus: chance ajoutée par ce ticket}] et la chance totale d'avoir au moins un ticket gagnant.
+function construireTickets(t, k, mod, sty, N) {
+  const p = mod.p, T1 = choisirTicket(mod, k, sty), kind = PARIS[t].kind;
+  if (kind === "multi") { const L = ticketsMulti(p, k, T1, N); return {liste: L, total: L.reduce((s, x) => s + x.plus, 0)}; }
+  const liste = [{T: T1, plus: probasTicket(t, p, T1).win}];
+  if (N > 1) {
+    const ordre = kind === "seq" && k > 1;
+    const cle = T => (ordre ? T : T.slice().sort((a, b) => a - b)).join(",");
+    const vivier = [...new Set(p.map((_, i) => i).sort((a, b) => p[b] - p[a]).slice(0, Math.min(p.length, k + 3)).concat(T1))];
+    const cands = [];
+    for (const s of combinaisons(vivier, k)) {
+      const base = [...s].sort((a, b) => p[b] - p[a]);
+      for (const T of (ordre ? permutations(base) : [base])) if (cle(T) !== cle(T1)) cands.push({T, plus: probasTicket(t, p, T).win});
+    }
+    cands.sort((a, b) => b.plus - a.plus);
+    liste.push(...cands.slice(0, N - 1));
+  }
+  // les tickets « ordre exact » ou « les k premiers » ne peuvent pas gagner en même temps : les chances s'additionnent
+  const total = kind === "in" && liste.length > 1 ? auMoinsUn(p, liste.map(x => x.T), placesPlace(t, p.length)) : liste.reduce((s, x) => s + x.plus, 0);
+  return {liste, total};
 }
 
 // ---------- rapports : vrais rapports probables du PMU, sinon estimation calée sur les jours passés
@@ -1196,53 +1232,56 @@ function calculer() {
   const t = pari, info = PARIS[t], k = tailleTicket(t), mise = maMise();
   const base = ((courant.paris || []).find(p => p.t === t) || {}).base;
   const w = poids(); for (const kk in w) $("v" + kk).textContent = w[kk];
-  $("tTitre").textContent = `Ticket conseillé — ${nomPari(t, courant)}${t === "MULTI" ? " en " + k : ""}, mise ${euro(mise)}`;
   $("tRegle").textContent = "Pour gagner : " + info.regle + " Style " + STYLES[style].nom + " : " + STYLES[style].txt;
   if (n < k + 1) { $("tNums").textContent = "Pas assez de partants pour ce pari."; return; }
   chargerProbables();
   const jour0 = new Date(); jour0.setHours(0, 0, 0, 0);
   const mod = modele(P, w, sources, {distance: courant.distance, hippodrome: courant.hippodrome, discipline: courant.discipline, jour: +jour0}), p = mod.p;
   const ordonne = info.kind === "seq" && k > 1 || info.kind === "od";
-  let T, selSet, res, gainTxt = "–", gainLab = "gain si le ticket passe";
-
-  if (t === "MULTI") {
-    T = choisirTicket(mod, k, style); selSet = new Set(T);
-    const e = esperanceMulti(mod, T, k);
-    res = {win: couvertureMulti(p, T), ratio: e ? e.ratio : null, source: e ? "estime" : null};
-    if (e) { gainTxt = "≈ " + euro(e.siGagne * mise); gainLab = `gain estimé si le ticket passe (de ${euro(e.mini * mise)} à ${euro(e.maxi * mise)} selon l'arrivée)`; }
-    // variante : la mise répartie sur 3 tickets qui se complètent
-    const miseT = Math.floor(mise / 3 * 100) / 100; let total = 0, retF = 0, html = "";
-    $("varBox").hidden = false;
-    $("fTitre").textContent = miseT >= 1.5 ? `Variante : 3 tickets à ${euro(miseT)} = ${euro(3 * miseT)}` : "Variante 3 tickets : il faut au moins 4,50 € (1,50 € par ticket)";
-    for (const x of (miseT >= 1.5 ? troisTickets(p, k, T) : [])) {
-      total += x.gain; const ex = esperanceMulti(mod, [...x.set], k); if (ex) retF += ex.ratio * miseT;
-      const o = [...x.set].sort((a, b) => p[b] - p[a]);
-      html += `<div class="row">${o.map(i => `<span class="n small">${P[i].num}</span>`).join("")}<em>+${pct(x.gain)}</em></div>`;
+  const N = nbTickets(), tk = construireTickets(t, k, mod, style, N), nb = tk.liste.length, totalMise = nb * mise;
+  const T = tk.liste[0].T, selSet = new Set(T);
+  $("tTitre").textContent = (nb > 1 ? `${nb} tickets conseillés` : "Ticket conseillé") + ` — ${nomPari(t, courant)}${t === "MULTI" ? " en " + k : ""}, ` +
+    (nb > 1 ? `${nb} × ${euro(mise)} = ${euro(totalMise)}` : `mise ${euro(mise)}`);
+  // évaluation de chaque ticket : rapport pour 1 € et part de la mise rendue en moyenne
+  let ratioTot = 0, ratioOk = true, source = null, gPond = 0, pPond = 0, ordreTot = 0;
+  const lignesT = tk.liste.map((x, r) => {
+    let e, gain = "";
+    if (t === "MULTI") { const m = esperanceMulti(mod, x.T, k);
+      e = {ratio: m ? m.ratio : null, source: m ? "estime" : null, win: couvertureMulti(p, x.T), r: m ? m.siGagne : null, mini: m && m.mini, maxi: m && m.maxi};
+      if (m) gain = `≈ ${euro(m.siGagne * mise)} (de ${euro(m.mini * mise)} à ${euro(m.maxi * mise)})`;
+    } else { e = evaluer(t, P, mod, x.T);
+      if (info.kind === "od") { if (e.rDes && e.rOrd) { gain = `≈ ${euro(e.rDes * mise)} dans le désordre · ≈ ${euro(e.rOrd * mise)} dans l'ordre`; e.r = e.rDes; } ordreTot += e.ordre || 0; }
+      else if (e.r) gain = e.rMin ? `${euro(e.rMin * mise)} à ${euro(e.rMax * mise)}` : "≈ " + euro(e.r * mise);
     }
-    $("fTickets").innerHTML = html;
-    $("fTotal").textContent = total ? `Ensemble : ${pct(total)} de chances d'avoir au moins un ticket gagnant (${sur(total)}).` + (retF ? ` Gain moyen attendu : ${signe(retF - 3 * miseT)} pour ${euro(3 * miseT)}.` : "") : "";
+    if (e.ratio === null || !isFinite(e.ratio)) ratioOk = false; else { ratioTot += e.ratio; source = source === "estime" ? source : e.source; }
+    if (e.r) { gPond += e.win * e.r; pPond += e.win; }
+    x.gainTxt = gain;
+    const chips = x.T.map((i, q) => `<span class="n">${P[i].num}${ordonne ? `<i>${q + 1}${q ? "e" : "er"}</i>` : ""}</span>`).join("");
+    if (nb === 1) return chips;
+    return `<div class="tk"><span class="lab">Ticket ${r + 1}<b>${r ? "+" : ""}${pct(x.plus)} de chances${gain ? " · gain " + gain : ""}</b></span>${chips}</div>`;
+  });
+  $("tNums").innerHTML = lignesT.join("");
+  $("tNums").className = "nums" + (ordonne ? " ord" : "") + (nb > 1 ? " plusieurs" : "");
+  $("tProba").textContent = pct(tk.total);
+  $("tProbaLab").textContent = (nb > 1 ? "chance qu'au moins un ticket passe" : "chance de gagner") + (info.kind === "od" ? ` (dont ${pct(ordreTot)} dans l'ordre exact)` : "");
+  $("tChance").textContent = sur(tk.total);
+  if (nb === 1) {
+    $("tRapport").textContent = tk.liste[0].gainTxt ? tk.liste[0].gainTxt.split(" (")[0].split(" dans le")[0] : "–";
+    $("tRapportLab").textContent = !tk.liste[0].gainTxt ? "gain si le ticket passe"
+      : t === "MULTI" ? "gain estimé si le ticket passe " + "(" + tk.liste[0].gainTxt.split(" (")[1]
+      : info.kind === "od" ? "gain estimé dans le désordre · " + tk.liste[0].gainTxt.split(" · ")[1]
+      : source === "pmu" ? "gain si le ticket passe (rapport probable PMU)" : "gain estimé si le ticket passe";
   } else {
-    $("varBox").hidden = true;
-    T = choisirTicket(mod, k, style); selSet = new Set(T);
-    res = evaluer(t, P, mod, T);
-    if (info.kind === "od") {
-      if (res.rDes && res.rOrd) { gainTxt = "≈ " + euro(res.rDes * mise); gainLab = `gain estimé dans le désordre · ≈ ${euro(res.rOrd * mise)} dans l'ordre`; }
-    } else if (res.r) {
-      gainTxt = (res.rMin ? "" : "≈ ") + (res.rMin ? `${euro(res.rMin * mise)} à ${euro(res.rMax * mise)}` : euro(res.r * mise));
-      gainLab = res.source === "pmu" ? "gain si le ticket passe (rapport probable PMU)" : "gain estimé si le ticket passe";
-    }
+    $("tRapport").textContent = pPond ? "≈ " + euro(gPond / pPond * mise) : "–";
+    $("tRapportLab").textContent = `gain moyen quand un ticket passe, pour ${euro(totalMise)} misés en tout`;
   }
-  $("tNums").innerHTML = T.map((i, r) => `<span class="n">${P[i].num}${ordonne ? `<i>${r + 1}${r ? "e" : "er"}</i>` : ""}</span>`).join("");
-  $("tNums").className = "nums" + (ordonne ? " ord" : "");
-  $("tProba").textContent = pct(res.win);
-  $("tProbaLab").textContent = info.kind === "od" ? `chance de gagner (dont ${pct(res.ordre)} dans l'ordre exact)` : "chance de gagner";
-  $("tChance").textContent = sur(res.win);
-  $("tRapport").textContent = gainTxt; $("tRapportLab").textContent = gainLab;
-  verdict(res, mise);
-  $("copier").dataset.txt = T.map(i => P[i].num).join(" - ");
+  verdict({ratio: ratioOk ? ratioTot / nb : null, source}, totalMise);
+  $("copier").dataset.txt = tk.liste.map(x => x.T.map(i => P[i].num).join(" - ")).join("\n");
+  $("copier").textContent = nb > 1 ? "Copier les tickets" : "Copier les numéros";
   $("tNote").textContent = (base ? `Mise de base PMU pour ce pari : ${euro(base)}. ` : "") +
+    (nb > 1 ? "Le ticket 1 suit ton style ; les suivants sont les combinaisons les plus probables qu'il ne couvre pas. Chaque ticket se joue séparément. " : "") +
     (info.kind === "od" ? "Les bonus ne sont pas comptés dans le verdict. " : "") +
-    "Le verdict ne vaut que si le bilan ci-dessous montre que l'appli fait mieux que les favoris.";
+    "Le verdict ne vaut que si le test ci-dessous montre que l'appli fait mieux que les favoris.";
 
   // Outsiders à surveiller : hors des favoris des parieurs, mais mieux notés par l'appli ou cote en nette baisse
   const rang = p.map((_, i) => i).sort((x, y) => mod.marche[y] - mod.marche[x]);
@@ -1287,10 +1326,11 @@ function calculer() {
   // Arrivée
   const arr = donnees.arrivee || [], raps = (donnees.rapports || {})[t];
   if (arr.length >= 3) {
-    const g = raps ? gainReel(t, k, T.map(i => P[i].num), raps) : null;
+    const g = raps ? tk.liste.reduce((s, x) => s + gainReel(t, k, x.T.map(i => P[i].num), raps), 0) : null;
     $("resultat").hidden = false;
     $("resultat").textContent = `Arrivée : ${arr.join(" - ")}. ` + (g === null ? "Rapports de ce pari pas encore publiés."
-      : g > 0 ? `Le ticket conseillé était GAGNANT : ${euro(g * mise)} pour ${euro(mise)} misés.` : "Le ticket conseillé était perdant.");
+      : g > 0 ? `${nb > 1 ? "Tes tickets conseillés étaient GAGNANTS" : "Le ticket conseillé était GAGNANT"} : ${euro(g * mise)} pour ${euro(totalMise)} misés.`
+      : nb > 1 ? "Aucun des tickets conseillés n'est passé." : "Le ticket conseillé était perdant.");
   } else $("resultat").hidden = true;
 }
 
@@ -1339,7 +1379,7 @@ function calculerBilan() {
   const auj = new Date(); auj.setHours(0, 0, 0, 0);
   const age = j => Math.round((auj - new Date(+j.date.slice(4), +j.date.slice(2, 4) - 1, +j.date.slice(0, 2))) / 86400000);
   const data = cache.courses.filter(j => age(j) <= periode());
-  const w = poids(), k = tailleTicket(t), mise = maMise(), multi = t === "MULTI";
+  const w = poids(), k = tailleTicket(t), mise = maMise(), multi = t === "MULTI", N = nbTickets();
   const cles = ["prudent", "equilibre", "outsiders", "fav"], st = {};
   for (const c of cles) st[c] = {n: 0, g: 0, mise: 0, ret: 0};
   const lignes = [];
@@ -1349,23 +1389,25 @@ function calculerBilan() {
     if (multi && !raps.some(r => new RegExp("en " + k + "$").test(r.l.toLowerCase()))) continue;
     const dj = j.date, jourJ = +new Date(+dj.slice(4), +dj.slice(2, 4) - 1, +dj.slice(0, 2));
     const mod = modele(P, w, {}, {distance: j.distance, hippodrome: j.hippodrome, discipline: j.discipline, jour: jourJ}), nums = idx => idx.map(i => P[i].num), gains = {};
-    for (const c of ["prudent", "equilibre", "outsiders"]) gains[c] = gainReel(t, k, nums(choisirTicket(mod, k, c)), raps) * mise;
-    const fav = P.map((_, i) => i).sort((x, y) => (P[x].coteDirect || 999) - (P[y].coteDirect || 999)).slice(0, k);
-    gains.fav = gainReel(t, k, nums(fav), raps) * mise;
-    for (const c of cles) { st[c].n++; st[c].mise += mise; if (gains[c]) { st[c].g++; st[c].ret += gains[c]; } }
+    const jouer = (m, sty) => { const L = construireTickets(t, k, m, sty, N).liste;
+      return {g: L.reduce((s, x) => s + gainReel(t, k, nums(x.T), raps), 0) * mise, nb: L.length}; };
+    const res = {};
+    for (const c of ["prudent", "equilibre", "outsiders"]) res[c] = jouer(mod, c);
+    res.fav = jouer({p: mod.marche, marche: mod.marche}, "prudent");       // les favoris des parieurs, sans analyse
+    for (const c of cles) { gains[c] = res[c].g; st[c].n++; st[c].mise += mise * res[c].nb; if (gains[c]) { st[c].g++; st[c].ret += gains[c]; } }
     const d = j.date, cell = g => `<td class="${g ? "tr-down" : ""}">${g ? "✓ +" + euro(g) : "✗"}</td>`;
     lignes.push(`<tr><td class="l">${d.slice(0, 2)}/${d.slice(2, 4)}</td><td class="l">${esc(j.hippodrome)} R${j.r}C${j.c}</td>
       <td class="l">${j.arrivee.join("-")}</td>${cles.map(c => cell(gains[c])).join("")}</tr>`);
   }
   const carte = (titre, s, sous, actif) => `<div class="bcard${actif ? " actif" : ""}"><h3>${titre}</h3><div class="sub">${sous}</div>
       <div class="bnet ${s.ret - s.mise >= 0 ? "tr-down" : "tr-up"}">${signe(s.ret - s.mise)}</div>
-      <div class="sub"><b>${s.mise ? Math.round(100 * s.ret / s.mise) : 0} % de la mise récupérée</b> · ${s.g} ticket${s.g > 1 ? "s" : ""} payé${s.g > 1 ? "s" : ""} sur ${s.n} · misé ${euro(s.mise)} · récupéré ${euro(s.ret)}</div></div>`;
+      <div class="sub"><b>${s.mise ? Math.round(100 * s.ret / s.mise) : 0} % de la mise récupérée</b> · ${s.g} jour${s.g > 1 ? "s" : ""} gagnant${s.g > 1 ? "s" : ""} sur ${s.n} · misé ${euro(s.mise)} · récupéré ${euro(s.ret)}</div></div>`;
   $("bCartes").innerHTML = st.fav.n ? ["prudent", "equilibre", "outsiders"].map(c =>
-      carte("Style " + STYLES[c].nom, st[c], c === style ? "ton style actuel" : "ticket de l'appli", c === style)).join("") +
+      carte("Style " + STYLES[c].nom, st[c], c === style ? "ton style actuel" : (N > 1 ? "tickets de l'appli" : "ticket de l'appli"), c === style)).join("") +
     carte(k > 1 ? `Les ${k} favoris` : "Le favori", st.fav, k > 1 ? "les plus petites cotes, sans analyse" : "la plus petite cote, sans analyse") : "";
   $("bCorps").innerHTML = lignes.join("");
   $("bEtat").textContent = bilanAvance + (st.fav.n
-    ? `${st.fav.n} courses analysées, ${PARIS[t].nom}${multi ? " en " + k : ""} à ${euro(mise)} par jour : chaque jour, la course proposant ce pari la plus proche de ${HEURE_CIBLE.replace(":", "h")}. Gains calculés avec les vrais rapports du PMU. Calcul fait avec les cotes finales : en vrai, quelques minutes avant le départ, c'est un peu moins bon.`
+    ? `${st.fav.n} courses analysées, ${PARIS[t].nom}${multi ? " en " + k : ""} ${N > 1 ? ", " + N + " tickets" : ""} à ${euro(mise)} ${N > 1 ? "chacun" : "par jour"} : chaque jour, la course proposant ce pari la plus proche de ${HEURE_CIBLE.replace(":", "h")}. Gains calculés avec les vrais rapports du PMU. Calcul fait avec les cotes finales : en vrai, quelques minutes avant le départ, c'est un peu moins bon.`
     : "Aucune course exploitable pour ce pari sur la période.");
 }
 
@@ -1381,6 +1423,8 @@ function spark(h) {
 function recalcul() { calculer(); clearTimeout(bilanTimer); bilanTimer = setTimeout(calculerBilan, 400); }
 for (const k of CURSEURS) $(k).addEventListener("input", e => {
   try { localStorage.setItem("ml_" + k, e.target.value); } catch (_) {} recalcul(); });
+$("nbt").addEventListener("change", e => {
+  try { localStorage.setItem("ml_nbt", e.target.value); } catch (_) {} recalcul(); });
 $("periode").addEventListener("change", e => {
   try { localStorage.setItem("ml_periode", e.target.value); } catch (_) {} chargerBilan(); });
 $("style").addEventListener("change", e => {
@@ -1390,9 +1434,10 @@ for (const id of ["formule", "mise"]) $(id).addEventListener(id === "mise" ? "in
 
 $("copier").addEventListener("click", async e => {
   const t = e.target.dataset.txt || "";
-  try { await navigator.clipboard.writeText(t); e.target.textContent = "Copié : " + t; }
-  catch (_) { e.target.textContent = t; }
-  setTimeout(() => e.target.textContent = "Copier les numéros", 2500);
+  const avant = e.target.textContent;
+  try { await navigator.clipboard.writeText(t); e.target.textContent = "Copié : " + t.replace(/\n/g, " | "); }
+  catch (_) { e.target.textContent = t.replace(/\n/g, " | "); }
+  setTimeout(() => e.target.textContent = avant, 2500);
 });
 
 function afficherSources() {
