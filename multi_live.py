@@ -512,6 +512,41 @@ def demo_jour(i):
             "partants": partants, "arrivee": arr, "rapports": demo_definitifs(partants, arr, rnd)}
 
 
+def demo_pmu(chemin):
+    """Réponses au format exact du PMU, fabriquées à partir des données de démo (test de la connexion directe)."""
+    morceaux = [m for m in chemin.split("/") if m]
+    if len(morceaux) == 1:
+        reunions = {}
+        for c in demo_programme(morceaux[0]):
+            reu = reunions.setdefault(c["r"], {"numOfficiel": c["r"], "hippodrome": {"libelleCourt": c["hippodrome"]}, "courses": []})
+            reu["courses"].append({"numOrdre": c["c"], "libelle": c["libelle"], "heureDepart": c["heure"],
+                                   "discipline": c["discipline"], "distance": c["distance"],
+                                   "nombreDeclaresPartants": c["partants"], "statut": c["statut"],
+                                   "paris": [{"typePari": "E_" + ("MINI_MULTI" if p["t"] == "MULTI" and c["mini"] else p["t"]),
+                                              "miseBase": int(p["base"] * 100)} for p in c["paris"]]})
+        return {"programme": {"reunions": list(reunions.values())}}
+    partants, _ = demo_partants()
+    if morceaux[-1] == "participants":
+        return {"participants": [{"numPmu": p["num"], "nom": p["nom"], "statut": "PARTANT" if p["partant"] else "NON_PARTANT",
+                                  "musique": p["musique"], "driver": p["driver"], "nombreCourses": p["courses"],
+                                  "nombreVictoires": p["victoires"], "nombrePlaces": p["places"],
+                                  "dernierRapportDirect": {"rapport": p["coteDirect"]} if p["coteDirect"] else None,
+                                  "dernierRapportReference": {"rapport": p["coteMatin"]},
+                                  "deferre": p["deferre"], "avisEntraineur": p["avis"], "oeilleres": p["oeilleres"],
+                                  "driverChange": False} for p in partants]}
+    if "performances-detaillees" in morceaux:
+        return {"participants": [{"numPmu": p["num"], "coursesCourues": [
+            {"date": r["d"], "hippodrome": r["h"], "discipline": r["disc"], "distance": r["dist"], "nbParticipants": r["n"],
+             "participants": [{"itsHim": False, "place": {"place": 1}, "nomJockey": "X"},
+                              {"itsHim": True, "place": {"place": r["pl"]}, "nomJockey": r["j"], "reductionKilometrique": r["rk"]}]}
+            for r in p["perfs"]]} for p in partants]}
+    if "rapports" in morceaux:
+        prob = demo_probables(partants, morceaux[-1].replace("E_", "")) or []
+        return {"rapportsParticipant": [{"numerosParticipant": x[0], "rapportDirect": x[1],
+                                         "minRapportProbable": x[2], "maxRapportProbable": x[3]} for x in prob]}
+    return {}
+
+
 # ------------------------------------------------------------------ serveur web
 
 class Handler(BaseHTTPRequestHandler):
@@ -544,6 +579,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.envoyer(200, data, "image/png")
             if u.path == "/sw.js":
                 return self.envoyer(200, SW, "text/javascript; charset=utf-8")
+            if DEMO and u.path.startswith("/pmu/"):
+                return self.envoyer(200, json.dumps(demo_pmu(u.path[5:])))
+            if DEMO and u.path == "/api/panne":          # test : simule un PMU qui bloque le serveur
+                PMU_ETAT["panne"] = q.get("on", "1") == "1"
+                return self.envoyer(200, "{}")
+            if DEMO and PMU_ETAT.get("panne") and u.path in ("/api/courses", "/api/course"):
+                return self.envoyer(502, json.dumps({"erreur": "Le PMU ne répond pas pour le moment (erreur 504)"}))
             if u.path == "/api/courses":
                 return self.envoyer(200, json.dumps({"date": jour, "demo": DEMO, "courses": liste_courses(jour)}))
             if u.path == "/api/bilan":
@@ -884,10 +926,104 @@ const offre = (c, t) => (c.paris || []).some(p => p.t === t);
 const tailleTicket = t => t === "MULTI" ? formule() : PARIS[t].k;
 const nomPari = (t, c) => t === "MULTI" && c && c.mini ? "Mini Multi" : PARIS[t].nom;
 
+// ---------- secours : si le serveur n'obtient plus rien du PMU, le téléphone l'interroge lui-même
+const PMU = /[?&]pmutest/.test(location.search) ? "/pmu" : "https://online.turfinfo.api.pmu.fr/rest/client/1/programme";
+const SUFFIXE = PMU === "/pmu" ? "" : "?specialisation=INTERNET";
+const AVEC_PROBABLES = new Set(["SIMPLE_PLACE", "COUPLE_GAGNANT", "COUPLE_PLACE", "COUPLE_ORDRE", "DEUX_SUR_QUATRE", "TRIO", "TRIO_ORDRE"]);
+let direct = false;                         // true = le téléphone interroge le PMU sans passer par le serveur
+const directMem = {perfs: {}, histo: {}, definitifs: {}};
+async function pmuJson(chemin) {
+  const r = await fetch(PMU + "/" + chemin + SUFFIXE);
+  if (!r.ok) throw new Error("PMU " + r.status);
+  return r.json();
+}
+function typePMU(tp) {                      // "E_MINI_MULTI" -> ["MULTI", true]
+  let t = String(tp || "").toUpperCase().replace(/^E_/, "").replace("TIERCÉ", "TIERCE");
+  if (t === "MINI_MULTI") return ["MULTI", true];
+  return [PARIS[t] ? t : null, false];
+}
+const aplatir = o => (o || []).reduce((a, g) => a.concat(g), []).slice(0, 5);
+async function directCourses() {
+  const jour = jjmmaaaa(new Date()), data = await pmuJson(jour), ordre = Object.keys(PARIS), out = [];
+  for (const reu of (data.programme || {}).reunions || []) for (const c of reu.courses || []) {
+    const paris = []; let mini = false;
+    for (const p of c.paris || []) { const [t, m] = typePMU(p.typePari);
+      if (t && !paris.some(x => x.t === t)) { paris.push({t, base: (p.miseBase || 0) / 100}); mini = mini || m; } }
+    paris.sort((a, b) => ordre.indexOf(a.t) - ordre.indexOf(b.t));
+    out.push({r: reu.numOfficiel, c: c.numOrdre, hippodrome: (reu.hippodrome || {}).libelleCourt || "", libelle: c.libelle || "",
+              heure: c.heureDepart, discipline: c.discipline || "", distance: c.distance, partants: c.nombreDeclaresPartants,
+              paris, mini, statut: c.statut || "", arrivee: aplatir(c.ordreArrivee)});
+  }
+  out.sort((a, b) => (a.heure || 0) - (b.heure || 0));
+  return {date: jour, demo: false, courses: out};
+}
+async function directCourse(co, t, partie) {
+  const jour = jjmmaaaa(new Date()), base = `${jour}/R${co.r}/C${co.c}`, cle = base;
+  const data = await pmuJson(base + "/participants");
+  const partants = (data.participants || []).map(p => ({
+    num: p.numPmu, nom: p.nom || "?", partant: String(p.statut || "PARTANT").toUpperCase() === "PARTANT",
+    musique: p.musique || "", driver: p.driver || p.jockey || "",
+    courses: p.nombreCourses || 0, victoires: p.nombreVictoires || 0, places: p.nombrePlaces || 0,
+    coteMatin: (p.dernierRapportReference || {}).rapport || null, coteDirect: (p.dernierRapportDirect || {}).rapport || null,
+    deferre: p.deferre || "", avis: p.avisEntraineur || "", oeilleres: p.oeilleres || "", driverChange: !!p.driverChange}));
+  // dernières courses de chaque cheval : demandées une seule fois par course
+  if (!directMem.perfs[cle]) {
+    try {
+      const pd = await pmuJson(base + "/performances-detaillees/pretty"), lim = new Date(); lim.setHours(0, 0, 0, 0);
+      const m = {};
+      for (const part of pd.participants || []) m[part.numPmu] = (part.coursesCourues || []).filter(cc => cc.date && cc.date < +lim).map(cc => {
+        const lui = (cc.participants || []).find(x => x.itsHim); if (!lui) return null;
+        const pl = (lui.place || {}).place;
+        return {d: cc.date, h: cc.hippodrome || "", disc: cc.discipline || "", dist: cc.distance || 0, n: cc.nbParticipants || 0,
+                pl: Number.isInteger(pl) ? pl : 0, j: lui.nomJockey || "", rk: lui.reductionKilometrique || 0};
+      }).filter(Boolean).sort((a, b) => b.d - a.d).slice(0, 6);
+      directMem.perfs[cle] = m;
+    } catch (e) {}
+  }
+  const perfs = directMem.perfs[cle] || {};
+  let arrivee = [];
+  if (partie) { try { arrivee = aplatir((await pmuJson(base)).ordreArrivee); } catch (e) {} }
+  let probables = null, rapports = {};
+  if (arrivee.length < 3 && AVEC_PROBABLES.has(t)) {
+    try { probables = ((await pmuJson(base + "/rapports/E_" + t)).rapportsParticipant || [])
+      .filter(x => (x.numerosParticipant || []).length && (x.rapportDirect || x.minRapportProbable || x.maxRapportProbable))
+      .map(x => [x.numerosParticipant, x.rapportDirect, x.minRapportProbable, x.maxRapportProbable]);
+      if (!probables.length) probables = null; } catch (e) {}
+  }
+  if (arrivee.length >= 3) {
+    if (!directMem.definitifs[cle]) { try {
+      let d = await pmuJson(base + "/rapports-definitifs"); if (!Array.isArray(d)) d = Object.values(d).find(Array.isArray) || [];
+      const out = {};
+      for (const pa of d) { const [tt] = typePMU(pa.typePari); if (!tt || pa.rembourse) continue;
+        for (const rp of pa.rapports || []) { const comb = String(rp.combinaison || "").split("-").map(Number);
+          if (rp.dividendePourUnEuro && comb.every(Number.isInteger)) (out[tt] = out[tt] || []).push({l: String(rp.libelle || ""), c: comb, d: rp.dividendePourUnEuro / 100}); } }
+      if (Object.keys(out).length) directMem.definitifs[cle] = out; } catch (e) {} }
+    rapports = directMem.definitifs[cle] || {};
+  }
+  const now = Date.now(), h = directMem.histo[cle] || (directMem.histo[cle] = {});
+  for (const p of partants) { p.perfs = perfs[p.num] || [];
+    if (p.coteDirect) { const s = h[p.num] || (h[p.num] = []); const d = s[s.length - 1];
+      if (!d || d[1] !== p.coteDirect || now - d[0] > 60000) { s.push([now, p.coteDirect]); if (s.length > 120) s.shift(); } }
+    p.histo = h[p.num] || []; }
+  return {partants, arrivee, probables, rapports, maj: now};
+}
+// Demande au serveur ; s'il échoue, essaie en direct, et y reste pour le reste de la session
+async function avecSecours(viaServeur, enDirect) {
+  if (!direct && !/[?&]direct/.test(location.search)) {
+    try { return await viaServeur(); }
+    catch (e) { try { const d = await enDirect(); direct = true; return d; } catch (_) { throw e; } }
+  }
+  return enDirect();
+}
+async function viaServeur(url, defaut) {
+  const r = await fetch(url); const j = await r.json();
+  if (!r.ok) throw new Error(j.erreur || defaut);
+  return j;
+}
+
 // ---------- programme
 async function chargerProgramme() {
-  const r = await fetch("/api/courses"); const j = await r.json();
-  if (!r.ok) throw new Error(j.erreur || "Programme indisponible");
+  const j = await avecSecours(() => viaServeur("/api/courses", "Programme indisponible"), directCourses);
   $("modeDemo").textContent = j.demo ? "— démo, courses fictives" : "";
   courses = j.courses.filter(c => (c.paris || []).length);
   remplirCourses();
@@ -950,11 +1086,12 @@ async function rafraichir() {
   const demande = courant.r + "-" + courant.c + "-" + pari;
   try {
     const partie = courant.heure && courant.heure <= Date.now() ? 1 : 0;
-    const r = await fetch(`/api/course?r=${courant.r}&c=${courant.c}&pari=${pari}&partie=${partie}`); const j = await r.json();
-    if (!r.ok) throw new Error(j.erreur || "Données indisponibles");
+    const co = courant, tp = pari;
+    const j = await avecSecours(() => viaServeur(`/api/course?r=${co.r}&c=${co.c}&pari=${tp}&partie=${partie}`, "Données indisponibles"),
+                                () => directCourse(co, tp, partie));
     if (demande !== courant.r + "-" + courant.c + "-" + pari) return;   // l'utilisateur a changé entre-temps
     donnees = j; $("erreur").hidden = true;
-    etat(true, "Cotes en direct · " + new Date(j.maj).toLocaleTimeString("fr-FR"));
+    etat(true, (direct ? "Connexion directe au PMU · " : "Cotes en direct · ") + new Date(j.maj).toLocaleTimeString("fr-FR"));
     calculer();
   } catch (e) {
     $("erreur").hidden = false; $("erreur").textContent = e.message + ". Nouvel essai dans 20 s.";
