@@ -132,12 +132,59 @@ def lire_partants(jour, r, c):
             "coteMatin": float(ref) if ref else None,
             "coteDirect": float(direct) if direct else None,
             "ordreArrivee": p.get("ordreArrivee"),
+            "deferre": p.get("deferre") or "", "avis": p.get("avisEntraineur") or "",
+            "oeilleres": p.get("oeilleres") or "", "driverChange": bool(p.get("driverChange")),
         })
     arrivee = sorted((p for p in partants if p.get("ordreArrivee")), key=lambda p: p["ordreArrivee"])
     arrivee = [p["num"] for p in arrivee] or arrivee_course(jour, r, c)
     for p in partants:
         p.pop("ordreArrivee", None)
     return partants, arrivee[:5]
+
+
+PERF_CACHE = {}
+
+
+def lire_performances(jour, r, c):
+    """Dernières courses de chaque cheval : {numPmu: [{"d": date ms, "h": hippodrome, "disc": discipline,
+    "dist": mètres, "n": partants, "pl": place (0 = non classé), "j": jockey/driver, "rk": réduction km}]}.
+    On ne garde que les courses d'avant le jour de la course étudiée."""
+    cle = (jour, r, c)
+    if cle in PERF_CACHE:
+        return PERF_CACHE[cle]
+    try:
+        data = get_json(f"{API}/{jour}/R{r}/C{c}/performances-detaillees/pretty?specialisation=INTERNET")
+    except Exception:
+        return {}
+    limite = datetime.strptime(jour, "%d%m%Y").timestamp() * 1000
+    out = {}
+    for part in data.get("participants", []) or []:
+        runs = []
+        for cc in part.get("coursesCourues", []) or []:
+            d = cc.get("date") or 0
+            if not d or d >= limite:
+                continue
+            lui = next((x for x in cc.get("participants", []) or [] if x.get("itsHim")), None)
+            if not lui:
+                continue
+            place = (lui.get("place") or {}).get("place") or 0
+            runs.append({"d": d, "h": cc.get("hippodrome") or "", "disc": cc.get("discipline") or "",
+                         "dist": cc.get("distance") or 0, "n": cc.get("nbParticipants") or 0,
+                         "pl": place if isinstance(place, int) else 0,
+                         "j": lui.get("nomJockey") or "", "rk": lui.get("reductionKilometrique") or 0})
+        runs.sort(key=lambda x: -x["d"])
+        out[part.get("numPmu")] = runs[:6]
+    if out:
+        PERF_CACHE[cle] = out
+        if len(PERF_CACHE) > 400:
+            PERF_CACHE.pop(next(iter(PERF_CACHE)))
+    return out
+
+
+def ajouter_performances(partants, jour, r, c):
+    perfs = lire_performances(jour, r, c)
+    for p in partants:
+        p["perfs"] = perfs.get(p["num"], [])
 
 
 def rapports_definitifs(jour, r, c):
@@ -191,6 +238,7 @@ def details_course(jour, r, c, pari):
         definitifs = {}
     else:
         partants, arrivee = lire_partants(jour, r, c)
+        ajouter_performances(partants, jour, r, c)
         probables = rapports_probables(jour, r, c, pari) if len(arrivee) < 3 else None
         definitifs = {}
         if len(arrivee) >= 3:
@@ -249,18 +297,21 @@ def bilan_jour(jour, heure, pari):
             rap = rapports_definitifs(jour, c["r"], c["c"])
             if not rap or len(arrivee) < 3:
                 return None
+            ajouter_performances(partants, jour, c["r"], c["c"])
             JOUR_CACHE[cle] = {"date": jour, "r": c["r"], "c": c["c"], "hippodrome": c["hippodrome"],
                                "libelle": c["libelle"], "heure": c["heure"], "mini": c["mini"],
+                               "distance": c.get("distance"), "discipline": c.get("discipline"),
                                "partants": partants, "arrivee": arrivee, "rapports": rap}
         return JOUR_CACHE[cle]
     except Exception:
         return None          # pas mis en cache : on réessaiera
 
 
-def bilan(jours, heure, pari):
+def bilan(jours, heure, pari, debut=1):
+    """Courses des jours passés, du jour « debut » (1 = hier) sur « jours » jours."""
     if DEMO:
-        return demo_bilan(jours)
-    dates = [(datetime.now() - timedelta(days=i)).strftime("%d%m%Y") for i in range(1, jours + 1)]
+        return demo_bilan(debut + jours - 1)[debut - 1:]
+    dates = [(datetime.now() - timedelta(days=i)).strftime("%d%m%Y") for i in range(debut, debut + jours)]
     with ThreadPoolExecutor(max_workers=6) as ex:
         res = list(ex.map(lambda d: bilan_jour(d, heure, pari), dates))
     return [x for x in res if x]
@@ -303,6 +354,26 @@ DEMO_CHEVAUX = [
 ]
 
 
+def demo_extras(partants, graine):
+    """Ferrage, avis de l'entraîneur et dernières courses fictifs, stables d'un appel à l'autre."""
+    rnd = random.Random(graine)
+    jour0 = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    for p in partants:
+        p["deferre"] = rnd.choice(["", "", "DEFERRE_ANTERIEURS_POSTERIEURS", "DEFERRE_ANTERIEURS", "PROTEGE_ANTERIEURS"])
+        p["avis"] = rnd.choice(["NEUTRE", "NEUTRE", "POSITIF", "NEGATIF"])
+        p["oeilleres"], p["driverChange"] = "SANS_OEILLERES", False
+        places = [int(ch) if ch.isdigit() else 0 for ch in p["musique"].replace("(25)", "")[::2]][:5]
+        age = rnd.randint(9, 30)
+        p["perfs"] = []
+        for pl in places:
+            p["perfs"].append({"d": int((jour0 - timedelta(days=age)).timestamp() * 1000),
+                               "h": rnd.choice(["VINCENNES", "ENGHIEN", "CABOURG"]), "disc": "ATTELE",
+                               "dist": rnd.choice([2100, 2700, 2850]), "n": 14, "pl": pl,
+                               "j": p["driver"] if rnd.random() < 0.6 else "X. AUTRE", "rk": rnd.randint(72000, 77000)})
+            age += rnd.randint(12, 40)
+    return partants
+
+
 def demo_partants():
     st = _demo_state
     if not st:
@@ -314,7 +385,7 @@ def demo_partants():
         out.append({"num": n, "nom": nom, "partant": n != 16, "musique": mus, "driver": drv,
                     "courses": crs, "victoires": vic, "places": pl,
                     "coteMatin": matin, "coteDirect": st[n] if n != 16 else None})
-    return out, []
+    return demo_extras(out, 7), []
 
 
 def _probas(partants):
@@ -381,9 +452,9 @@ def demo_definitifs(partants, arr, rnd):
 
 def demo_bilan(jours):
     """Jours passés fictifs : arrivée tirée au sort selon les cotes, rapports ~ 70-75 % du juste prix."""
-    rnd = random.Random(42)
     out = []
     for i in range(1, jours + 1):
+        rnd = random.Random(1000 + i)
         d = datetime.now() - timedelta(days=i)
         partants = []
         for n, nom, mus, matin, drv, crs, vic, pl in DEMO_CHEVAUX[:rnd.randint(13, 16)]:
@@ -391,6 +462,7 @@ def demo_bilan(jours):
             partants.append({"num": n, "nom": nom, "partant": True, "musique": mus, "driver": drv,
                              "courses": crs, "victoires": vic, "places": pl,
                              "coteMatin": round(cote * rnd.uniform(0.85, 1.15), 1), "coteDirect": cote})
+        demo_extras(partants, i)
         reste, arr = dict(_probas(partants)), []
         for _ in range(5):
             x, acc = rnd.random() * sum(reste.values()), 0
@@ -402,6 +474,7 @@ def demo_bilan(jours):
                     break
         out.append({"date": d.strftime("%d%m%Y"), "r": 1, "c": 3, "hippodrome": "VINCENNES", "libelle": "Course démo",
                     "heure": int(d.replace(hour=13, minute=55).timestamp() * 1000), "mini": False,
+                    "distance": 2850, "discipline": "ATTELE",
                     "partants": partants, "arrivee": arr, "rapports": demo_definitifs(partants, arr, rnd)})
     return out
 
@@ -441,10 +514,11 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/courses":
                 return self.envoyer(200, json.dumps({"date": jour, "demo": DEMO, "courses": liste_courses(jour)}))
             if u.path == "/api/bilan":
-                jours = max(1, min(60, int(q.get("jours", 30))))
+                jours = max(1, min(20, int(q.get("jours", 15))))
+                debut = max(1, min(400, int(q.get("debut", 1))))
                 heure = q.get("heure", "13:55")
-                return self.envoyer(200, json.dumps({"jours": jours, "heure": heure, "pari": pari,
-                                                     "courses": bilan(jours, heure, pari)}))
+                return self.envoyer(200, json.dumps({"jours": jours, "debut": debut, "heure": heure, "pari": pari,
+                                                     "courses": bilan(jours, heure, pari, debut)}))
             if u.path == "/api/course":
                 return self.envoyer(200, json.dumps(details_course(jour, int(q["r"]), int(q["c"]), pari)))
             return self.envoyer(404, json.dumps({"erreur": "introuvable"}))
@@ -602,6 +676,9 @@ header{align-items:center}
 .ticket .nums.ord .n{height:56px;align-content:center;line-height:1.1}
 .ticket .n i{display:block;font-style:normal;font-size:10px;font-weight:600;opacity:.85}
 .reglages{margin-top:16px}
+.tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px;width:230px;max-width:60vw}
+.tag{font-size:11px;padding:1px 6px;border-radius:99px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.tag.plus{border-color:var(--down);color:var(--down)} .tag.moins{border-color:var(--up);color:var(--up)}
 .out{display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
 .out:last-child{border-bottom:0}
 .out .num{grid-row:span 2}
@@ -661,7 +738,9 @@ table.btab{min-width:620px}
 </section>
 
 <section class="panel bilan">
-  <h2 id="bTitre">Bilan des 30 derniers jours</h2>
+  <h2 id="bTitre">Test sur les courses passées</h2>
+  <div class="champ" style="max-width:220px;margin-bottom:8px"><label for="periode">Période testée</label>
+    <select id="periode"><option value="30">30 derniers jours</option><option value="90">3 derniers mois</option><option value="180">6 derniers mois</option></select></div>
   <p class="sub" id="bEtat">Chargement…</p>
   <div class="bcartes" id="bCartes"></div>
   <details><summary>Détail jour par jour</summary>
@@ -679,6 +758,8 @@ table.btab{min-width:620px}
 </table>
 </div>
 
+<p class="sub" style="margin:8px 0 0">Étiquettes : <b>distance ✓</b>, <b>piste ✓</b>, <b>driver ✓</b> ou <b>jockey ✓</b> = le cheval a déjà bien couru sur cette distance, sur cette piste ou avec lui · <b>chrono ✓</b> = parmi les 3 meilleurs chronos récents (trot) · <b>avis + / −</b> = avis de l'entraîneur · <b>rentrée</b> = plus de 4 mois sans courir.</p>
+
 <section class="panel reglages">
   <details>
     <summary>Réglages avancés : poids des analyses, cotes d'autres sites</summary>
@@ -691,6 +772,10 @@ table.btab{min-width:620px}
         <small>Les 5 dernières places de la musique, la plus récente compte le plus.</small></div>
       <div class="sl"><label for="wR">Régularité</label><input id="wR" type="range" min="0" max="100" value="10"><span id="vR"></span>
         <small>Part des courses finies placé sur toute la carrière.</small></div>
+      <div class="sl"><label for="wA">Aptitudes</label><input id="wA" type="range" min="0" max="100" value="20"><span id="vA"></span>
+        <small>Résultats du cheval sur cette distance, sur cette piste et avec ce jockey ou driver, plus son chrono au trot.</small></div>
+      <div class="sl"><label for="wS">Signaux du jour</label><input id="wS" type="range" min="0" max="100" value="10"><span id="vS"></span>
+        <small>Ferrage (déferré), avis de l'entraîneur, fraîcheur depuis la dernière course.</small></div>
     </div>
     <p class="sub" style="margin-top:14px">Cotes d'un autre site : une ligne par cheval, <code>numéro;cote</code>. Donne un nom au site, puis Ajouter.</p>
     <input id="srcNom" placeholder="Nom du site (ex. Zeturf)" class="srcNom">
@@ -700,7 +785,7 @@ table.btab{min-width:620px}
   </details>
 </section>
 
-<p class="foot">Estimations à partir des cotes, de la musique et des statistiques du PMU. Elles aident à choisir, elles ne garantissent rien : le PMU prélève une part des mises, donc sur la durée aucune méthode ne gagne à coup sûr. Joue seulement ce que tu acceptes de perdre.</p>
+<p class="foot">Estimations à partir des données du PMU : cotes, musique, statistiques de carrière, dernières courses (distance, piste, jockey ou driver, chrono), ferrage et avis de l'entraîneur. Le terrain n'est pas pris en compte : le PMU ne le publie pas pour les courses passées. Elles aident à choisir, elles ne garantissent rien : le PMU prélève une part des mises, donc sur la durée aucune méthode ne gagne à coup sûr. Joue seulement ce que tu acceptes de perdre.</p>
 </div>
 
 <script>
@@ -739,7 +824,7 @@ let style = "prudent";
 let courses = [], courant = null, donnees = null, timer = null, sources = {}, pari = "MULTI", prefPari = "MULTI";
 try { sources = JSON.parse(localStorage.getItem("ml_sources") || "{}"); } catch (e) {}
 try {
-  for (const k of ["wM", "wT", "wF", "wR"]) { const v = localStorage.getItem("ml_" + k); if (v !== null) $(k).value = v; }
+  for (const k of ["wM", "wT", "wF", "wR", "wA", "wS"]) { const v = localStorage.getItem("ml_" + k); if (v !== null) $(k).value = v; }
   const f = localStorage.getItem("ml_formule"); if (f) $("formule").value = f;
   const mi = localStorage.getItem("ml_mise"); if (mi) $("mise").value = mi;
   const pp = localStorage.getItem("ml_pari"); if (pp && PARIS[pp]) prefPari = pp;
@@ -755,7 +840,8 @@ const sur = p => p > 0 ? "1 chance sur " + Math.max(1, Math.round(1 / p)).toLoca
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c])); }
 function formule() { return +$("formule").value; }
 function maMise() { let v = parseFloat(String($("mise").value).replace(",", ".")); if (!isFinite(v)) v = 3; return Math.min(60, Math.max(1, v)); }
-const poids = () => ({M: +$("wM").value, T: +$("wT").value, F: +$("wF").value, R: +$("wR").value});
+const CURSEURS = ["wM", "wT", "wF", "wR", "wA", "wS"];
+const poids = () => ({M: +$("wM").value, T: +$("wT").value, F: +$("wF").value, R: +$("wR").value, A: +$("wA").value, S: +$("wS").value});
 const offre = (c, t) => (c.paris || []).some(p => p.t === t);
 const tailleTicket = t => t === "MULTI" ? formule() : PARIS[t].k;
 const nomPari = (t, c) => t === "MULTI" && c && c.mini ? "Mini Multi" : PARIS[t].nom;
@@ -923,7 +1009,57 @@ function marchePMU(P, srcs) {
   const plancher = (connus.length ? Math.min(...connus) : 1 / P.length) / 2;
   return normaliser(m.map(x => x === null ? plancher : x));
 }
-function modele(P, w, srcs) {       // probabilité de gagner de chaque cheval, en croisant les 4 analyses
+// --- Aptitudes et signaux du jour, d'après les dernières courses et les déclarations du jour
+const notePlace = pl => pl === 1 ? 1 : pl === 2 ? .8 : pl === 3 ? .65 : pl === 4 ? .5 : pl === 5 ? .4 : pl >= 6 && pl <= 7 ? .2 : .05;
+const moyenne = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+const cleNom = s => String(s || "").toUpperCase().replace(/[^A-Z]/g, "");
+const TROT = d => /ATTELE|MONTE/i.test(d || "");
+function atouts(P, ctx) {            // ctx = {distance, hippodrome, discipline, jour (ms)}
+  ctx = ctx || {};
+  const hip = cleNom(ctx.hippodrome), trot = TROT(ctx.discipline);
+  const A = P.map(c => {
+    const runs = c.perfs || [], o = {dist: null, piste: null, jockey: null, chrono: null, jours: null};
+    if (!runs.length) return o;
+    const memeDisc = runs.filter(r => !ctx.discipline || r.disc === ctx.discipline);
+    if (ctx.distance) o.dist = moyenne(memeDisc.filter(r => r.dist && Math.abs(r.dist - ctx.distance) / ctx.distance <= 0.08).map(r => notePlace(r.pl)));
+    if (hip) o.piste = moyenne(runs.filter(r => { const h = cleNom(r.h); return h && (h.startsWith(hip) || hip.startsWith(h)); }).map(r => notePlace(r.pl)));
+    const j = cleNom(c.driver);
+    if (j) o.jockey = moyenne(runs.filter(r => cleNom(r.j) === j).map(r => notePlace(r.pl)));
+    if (trot) { const rk = memeDisc.map(r => r.rk).filter(x => x > 0); if (rk.length) o.rk = Math.min(...rk); }
+    if (ctx.jour) o.jours = Math.round((ctx.jour - runs[0].d) / 86400000);
+    return o;
+  });
+  // chrono : comparé aux autres partants (plus petit = plus rapide)
+  const rks = A.map(o => o.rk).filter(Boolean);
+  if (rks.length >= 4) {
+    const m = moyenne(rks), sd = Math.sqrt(moyenne(rks.map(x => (x - m) * (x - m)))) || 1;
+    const tri = rks.slice().sort((a, b) => a - b), seuil3 = tri[Math.min(2, tri.length - 1)];
+    A.forEach(o => { if (o.rk) { o.chrono = Math.min(1, Math.max(0, .5 + .22 * (m - o.rk) / sd)); o.topChrono = o.rk <= seuil3; } });
+  }
+  return A.map((o, i) => {
+    const c = P[i], comp = [o.dist, o.piste, o.jockey, o.chrono].filter(x => x !== null && x !== undefined);
+    o.apt = comp.length ? moyenne(comp) : null;
+    let s = .5; const def = c.deferre || "";
+    if (/DEFERRE_ANTERIEURS_POSTERIEURS/.test(def)) s += .2; else if (/^DEFERRE/.test(def)) s += .1;
+    if (c.avis === "POSITIF") s += .2; else if (c.avis === "NEGATIF") s -= .2;
+    if (o.jours !== null) { if (o.jours > 120) s -= .15; else if (o.jours >= 10 && o.jours <= 45) s += .05; }
+    o.signal = Math.min(1, Math.max(.05, s));
+    // étiquettes : [couleur, texte court pour le tableau, texte long pour les explications]
+    const t = [];
+    if (o.dist !== null && o.dist >= .55) t.push(["plus", "distance ✓", "à l'aise sur la distance"]);
+    if (o.piste !== null && o.piste >= .55) t.push(["plus", "piste ✓", "réussit sur cette piste"]);
+    if (o.jockey !== null && o.jockey >= .55) t.push(["plus", (trot ? "driver" : "jockey") + " ✓", "réussit avec " + (trot ? "ce driver" : "ce jockey")]);
+    if (o.topChrono) t.push(["plus", "chrono ✓", "bon chrono"]);
+    if (/DEFERRE_ANTERIEURS_POSTERIEURS/.test(def)) t.push(["plus", "déferré des 4", "déferré des 4"]);
+    else if (/^DEFERRE_ANTERIEURS/.test(def)) t.push(["", "déferré ant.", "déferré des antérieurs"]);
+    else if (/^DEFERRE_POSTERIEURS/.test(def)) t.push(["", "déferré post.", "déferré des postérieurs"]);
+    if (c.avis === "POSITIF") t.push(["plus", "avis +", "avis entraîneur positif"]); else if (c.avis === "NEGATIF") t.push(["moins", "avis −", "avis entraîneur négatif"]);
+    if (o.jours !== null && o.jours > 120) t.push(["moins", "rentrée", "rentrée après " + o.jours + " jours"]);
+    o.tags = t;
+    return o;
+  });
+}
+function modele(P, w, srcs, ctx) {       // probabilité de gagner de chaque cheval, en croisant les 6 analyses
   const marche = marchePMU(P, srcs);
   const mouv = normaliser(P.map((c, i) => {
     const f = c.coteMatin && c.coteDirect ? Math.min(2, Math.max(.5, c.coteMatin / c.coteDirect)) : 1;
@@ -933,9 +1069,15 @@ function modele(P, w, srcs) {       // probabilité de gagner de chaque cheval, 
   const moyF = ok.length ? ok.reduce((a, b) => a + b, 0) / ok.length : .3;
   const forme = normaliser(fr.map(x => Math.pow(x === null ? moyF : x, 2)));
   const regul = normaliser(P.map(c => { const r = (c.places + .9) / ((c.courses || 0) + 3); return r * r; }));
-  const W = (w.M + w.T + w.F + w.R) || 1;
-  const p = normaliser(P.map((_, i) => (w.M * marche[i] + w.T * mouv[i] + w.F * forme[i] + w.R * regul[i]) / W));
-  return {p, marche, fr};
+  const at = atouts(P, ctx);
+  const moyA = moyenne(at.map(o => o.apt).filter(x => x !== null));
+  const aucuneApt = moyA === null;                // pas de courses passées connues : l'analyse est mise de côté
+  const apt = normaliser(at.map(o => Math.pow(o.apt === null ? (moyA || .3) : o.apt, 2)));
+  const sig = normaliser(at.map(o => o.signal * o.signal));
+  const wA = aucuneApt ? 0 : (w.A || 0), wS = w.S || 0;
+  const W = (w.M + w.T + w.F + w.R + wA + wS) || 1;
+  const p = normaliser(P.map((_, i) => (w.M * marche[i] + w.T * mouv[i] + w.F * forme[i] + w.R * regul[i] + wA * apt[i] + wS * sig[i]) / W));
+  return {p, marche, fr, at};
 }
 // Choix du ticket selon le style. Un « outsider » est un cheval hors des favoris des parieurs ;
 // on prend ceux que l'appli note le mieux par rapport à leur cote (proba × avantage sur le marché).
@@ -984,7 +1126,7 @@ const estDesordre = l => /d[ée]sordre/i.test(l);
 const estOrdre = (t, l) => !estDesordre(l) && (/ordre/i.test(l) || ORDONNES.has(t));
 function calerK(t) {
   const A = [], O = [], kind = PARIS[t].kind;
-  for (const j of bilanCache[t] || []) {
+  for (const j of (bilanCache[t] || {}).courses || []) {
     const P = j.partants.filter(c => c.partant), mk = marchePMU(P, {});
     for (const rap of j.rapports[t] || []) {
       const lib = rap.l.toLowerCase(); if (lib.includes("bonus")) continue;
@@ -1058,7 +1200,8 @@ function calculer() {
   $("tRegle").textContent = "Pour gagner : " + info.regle + " Style " + STYLES[style].nom + " : " + STYLES[style].txt;
   if (n < k + 1) { $("tNums").textContent = "Pas assez de partants pour ce pari."; return; }
   chargerProbables();
-  const mod = modele(P, w, sources), p = mod.p;
+  const jour0 = new Date(); jour0.setHours(0, 0, 0, 0);
+  const mod = modele(P, w, sources, {distance: courant.distance, hippodrome: courant.hippodrome, discipline: courant.discipline, jour: +jour0}), p = mod.p;
   const ordonne = info.kind === "seq" && k > 1 || info.kind === "od";
   let T, selSet, res, gainTxt = "–", gainLab = "gain si le ticket passe";
 
@@ -1110,6 +1253,7 @@ function calculer() {
     if (mod.fr[i] !== null && mod.fr[i] >= 0.55) raisons.push(`bonne forme récente (${Math.round(mod.fr[i] * 100)}/100)`);
     if (c.courses >= 5 && c.places / c.courses >= 0.45) raisons.push(`régulier (${Math.round(100 * c.places / c.courses)} % de places)`);
     if (baisse >= 0.12) raisons.push(`cote en baisse de ${Math.round(baisse * 100)} %`);
+    for (const x of mod.at[i].tags) if (x[0] === "plus") raisons.push(x[2]);
     if (raisons.length && (val >= 1.1 || baisse >= 0.12)) outs.push({i, val, raisons});
   });
   outs.sort((a, b) => b.val - a.val);
@@ -1128,7 +1272,7 @@ function calculer() {
       cls = d < -0.03 ? "tr-down" : d > 0.03 ? "tr-up" : ""; evo = (d < 0 ? "▼ " : d > 0 ? "▲ " : "") + Math.abs(d * 100).toFixed(0) + " %"; }
     return `<tr class="${selSet.has(i) ? "sel" : ""}">
       <td class="l"><span class="num">${c.num}</span></td>
-      <td class="l"><div class="cheval">${esc(c.nom)}</div><div class="sub">${esc(c.driver || "")} · ${esc(c.musique || "")}</div></td>
+      <td class="l"><div class="cheval">${esc(c.nom)}</div><div class="sub">${esc(c.driver || "")} · ${esc(c.musique || "")}</div>${mod.at[i].tags.length ? `<div class="tags">${mod.at[i].tags.map(x => `<span class="tag ${x[0]}" title="${x[2]}">${x[1]}</span>`).join("")}</div>` : ""}</td>
       <td>${c.coteMatin ? c.coteMatin.toFixed(1).replace(".", ",") : "–"}</td>
       <td><b>${c.coteDirect ? c.coteDirect.toFixed(1).replace(".", ",") : "–"}</b></td>
       <td class="l ${cls}">${spark(c.histo)} ${evo}</td>
@@ -1159,26 +1303,42 @@ function verdict(e, mise) {
   else if (e.ratio >= 0.85) { cls = "mid"; titre = "Pari limite"; }
   else { cls = "ko"; titre = "Pari défavorable : passe ton tour"; }
   el.className = "verdict " + cls;
-  el.innerHTML = `<b>${titre}</b><span>Gain moyen attendu : ${signe((e.ratio - 1) * mise)} pour ${euro(mise)} misés (${Math.round(e.ratio * 100)} % de la mise rendue en moyenne) · ${e.source === "pmu" ? "d'après le rapport probable du PMU" : "rapport estimé d'après les 30 derniers jours"}</span>`;
+  el.innerHTML = `<b>${titre}</b><span>Gain moyen attendu : ${signe((e.ratio - 1) * mise)} pour ${euro(mise)} misés (${Math.round(e.ratio * 100)} % de la mise rendue en moyenne) · ${e.source === "pmu" ? "d'après le rapport probable du PMU" : "rapport estimé d'après les courses passées"}</span>`;
 }
 
 // ---------- bilan des jours passés
-const bilanCache = {}; let bilanTimer = null;
+const bilanCache = {}; let bilanTimer = null, bilanAvance = "";
+const periode = () => +$("periode").value;
+try { const pe = localStorage.getItem("ml_periode"); if (pe) $("periode").value = pe; } catch (e) {}
+// Les jours passés sont chargés par tranches de 15 jours, pour afficher les résultats au fur et à mesure
 async function chargerBilan() {
   const t = pari;
-  $("bTitre").textContent = `Bilan des 30 derniers jours — ${PARIS[t].nom}`;
-  if (bilanCache[t]) { calculerBilan(); calculer(); return; }
-  $("bCartes").innerHTML = ""; $("bCorps").innerHTML = "";
-  $("bEtat").textContent = "Calcul du bilan sur les 30 derniers jours… (jusqu'à 30 secondes la première fois)";
+  $("bTitre").textContent = `Test sur les courses passées — ${PARIS[t].nom}`;
+  const c = bilanCache[t] || (bilanCache[t] = {jours: 0, courses: [], enCours: false});
+  const afficher = () => { if (t === pari) { calerK(t); calculerBilan(); calculer(); } };
+  if (c.jours >= periode()) { bilanAvance = ""; afficher(); return; }
+  if (c.enCours) return;
+  c.enCours = true;
+  if (!c.jours) { $("bCartes").innerHTML = ""; $("bCorps").innerHTML = ""; }
   try {
-    const r = await fetch(`/api/bilan?jours=30&heure=${HEURE_CIBLE}&pari=${t}`); const j = await r.json();
-    if (!r.ok) throw new Error(j.erreur || "Bilan indisponible");
-    bilanCache[t] = j.courses; calerK(t);
-    if (t === pari) { calculerBilan(); calculer(); }
-  } catch (e) { if (t === pari) $("bEtat").textContent = "Bilan indisponible : " + e.message + ". Il sera recalculé à la prochaine ouverture."; }
+    while (t === pari && c.jours < periode()) {
+      bilanAvance = `Chargement des courses passées : ${c.jours} jours sur ${periode()}… `;
+      if (c.jours) afficher(); else $("bEtat").textContent = bilanAvance + "(quelques secondes par tranche de 15 jours)";
+      const n = Math.min(15, periode() - c.jours);
+      const r = await fetch(`/api/bilan?debut=${c.jours + 1}&jours=${n}&heure=${HEURE_CIBLE}&pari=${t}`); const j = await r.json();
+      if (!r.ok) throw new Error(j.erreur || "Test indisponible");
+      c.courses.push(...j.courses); c.jours += n;
+    }
+    bilanAvance = ""; afficher();
+  } catch (e) {
+    bilanAvance = ""; if (t === pari) { afficher(); $("bEtat").textContent = "Chargement interrompu : " + e.message + ". Rouvre l'appli pour le relancer. " + $("bEtat").textContent; }
+  } finally { c.enCours = false; }
 }
 function calculerBilan() {
-  const t = pari, data = bilanCache[t]; if (!data) return;
+  const t = pari, cache = bilanCache[t]; if (!cache) return;
+  const auj = new Date(); auj.setHours(0, 0, 0, 0);
+  const age = j => Math.round((auj - new Date(+j.date.slice(4), +j.date.slice(2, 4) - 1, +j.date.slice(0, 2))) / 86400000);
+  const data = cache.courses.filter(j => age(j) <= periode());
   const w = poids(), k = tailleTicket(t), mise = maMise(), multi = t === "MULTI";
   const cles = ["prudent", "equilibre", "outsiders", "fav"], st = {};
   for (const c of cles) st[c] = {n: 0, g: 0, mise: 0, ret: 0};
@@ -1187,7 +1347,8 @@ function calculerBilan() {
     const P = j.partants.filter(c => c.partant), raps = j.rapports[t];
     if (P.length < k + 1 || !raps || !raps.length) continue;
     if (multi && !raps.some(r => new RegExp("en " + k + "$").test(r.l.toLowerCase()))) continue;
-    const mod = modele(P, w, {}), nums = idx => idx.map(i => P[i].num), gains = {};
+    const dj = j.date, jourJ = +new Date(+dj.slice(4), +dj.slice(2, 4) - 1, +dj.slice(0, 2));
+    const mod = modele(P, w, {}, {distance: j.distance, hippodrome: j.hippodrome, discipline: j.discipline, jour: jourJ}), nums = idx => idx.map(i => P[i].num), gains = {};
     for (const c of ["prudent", "equilibre", "outsiders"]) gains[c] = gainReel(t, k, nums(choisirTicket(mod, k, c)), raps) * mise;
     const fav = P.map((_, i) => i).sort((x, y) => (P[x].coteDirect || 999) - (P[y].coteDirect || 999)).slice(0, k);
     gains.fav = gainReel(t, k, nums(fav), raps) * mise;
@@ -1198,14 +1359,14 @@ function calculerBilan() {
   }
   const carte = (titre, s, sous, actif) => `<div class="bcard${actif ? " actif" : ""}"><h3>${titre}</h3><div class="sub">${sous}</div>
       <div class="bnet ${s.ret - s.mise >= 0 ? "tr-down" : "tr-up"}">${signe(s.ret - s.mise)}</div>
-      <div class="sub">${s.g} ticket${s.g > 1 ? "s" : ""} payé${s.g > 1 ? "s" : ""} sur ${s.n} · misé ${euro(s.mise)} · récupéré ${euro(s.ret)}</div></div>`;
+      <div class="sub"><b>${s.mise ? Math.round(100 * s.ret / s.mise) : 0} % de la mise récupérée</b> · ${s.g} ticket${s.g > 1 ? "s" : ""} payé${s.g > 1 ? "s" : ""} sur ${s.n} · misé ${euro(s.mise)} · récupéré ${euro(s.ret)}</div></div>`;
   $("bCartes").innerHTML = st.fav.n ? ["prudent", "equilibre", "outsiders"].map(c =>
       carte("Style " + STYLES[c].nom, st[c], c === style ? "ton style actuel" : "ticket de l'appli", c === style)).join("") +
     carte(k > 1 ? `Les ${k} favoris` : "Le favori", st.fav, k > 1 ? "les plus petites cotes, sans analyse" : "la plus petite cote, sans analyse") : "";
   $("bCorps").innerHTML = lignes.join("");
-  $("bEtat").textContent = st.fav.n
+  $("bEtat").textContent = bilanAvance + (st.fav.n
     ? `${st.fav.n} courses analysées, ${PARIS[t].nom}${multi ? " en " + k : ""} à ${euro(mise)} par jour : chaque jour, la course proposant ce pari la plus proche de ${HEURE_CIBLE.replace(":", "h")}. Gains calculés avec les vrais rapports du PMU. Calcul fait avec les cotes finales : en vrai, quelques minutes avant le départ, c'est un peu moins bon.`
-    : "Aucune course exploitable pour ce pari sur la période.";
+    : "Aucune course exploitable pour ce pari sur la période.");
 }
 
 function spark(h) {
@@ -1218,8 +1379,10 @@ function spark(h) {
 
 // ---------- réglages
 function recalcul() { calculer(); clearTimeout(bilanTimer); bilanTimer = setTimeout(calculerBilan, 400); }
-for (const k of ["wM", "wT", "wF", "wR"]) $(k).addEventListener("input", e => {
+for (const k of CURSEURS) $(k).addEventListener("input", e => {
   try { localStorage.setItem("ml_" + k, e.target.value); } catch (_) {} recalcul(); });
+$("periode").addEventListener("change", e => {
+  try { localStorage.setItem("ml_periode", e.target.value); } catch (_) {} chargerBilan(); });
 $("style").addEventListener("change", e => {
   style = e.target.value; try { localStorage.setItem("ml_style", style); } catch (_) {} recalcul(); });
 for (const id of ["formule", "mise"]) $(id).addEventListener(id === "mise" ? "input" : "change", () => {
