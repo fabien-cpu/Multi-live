@@ -56,10 +56,33 @@ AVEC_PROBABLES = {"SIMPLE_PLACE", "COUPLE_GAGNANT", "COUPLE_PLACE", "COUPLE_ORDR
 
 # ------------------------------------------------------------------ accès PMU
 
-def get_json(url):
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode("utf-8"))
+# Le PMU coupe l'accès (erreur 504) quand on lui envoie trop de demandes d'un coup :
+# on espace donc toutes les demandes, et on suspend le chargement des courses passées dès qu'il sature.
+PMU_LOCK = threading.Lock()
+PMU_ETAT = {"prochain": 0.0, "pause": 0.0}
+ESPACE = 0.25                     # secondes entre deux demandes au PMU (4 par seconde au plus)
+SATURE = (429, 500, 502, 503, 504)
+
+
+def get_json(url, essais=2):
+    for essai in range(essais):
+        with PMU_LOCK:
+            maintenant = time.time()
+            attente = PMU_ETAT["prochain"] - maintenant
+            PMU_ETAT["prochain"] = max(maintenant, PMU_ETAT["prochain"]) + ESPACE
+        if attente > 0:
+            time.sleep(attente)
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code in SATURE:
+                PMU_ETAT["pause"] = time.time() + 180
+                if essai + 1 < essais:
+                    time.sleep(2)
+                    continue
+            raise
 
 
 def nom_pari(type_pmu):
@@ -100,6 +123,7 @@ def liste_courses(jour):
                 "discipline": c.get("discipline", ""), "distance": c.get("distance"),
                 "partants": c.get("nombreDeclaresPartants"), "paris": paris, "mini": mini,
                 "statut": c.get("statut", ""),
+                "arrivee": [n for g in (c.get("ordreArrivee") or []) for n in (g if isinstance(g, list) else [g])][:5],
             })
     out.sort(key=lambda x: x["heure"] or 0)
     return out
@@ -115,7 +139,7 @@ def arrivee_course(jour, r, c):
     return [n for groupe in ordre for n in (groupe if isinstance(groupe, list) else [groupe])]
 
 
-def lire_partants(jour, r, c):
+def lire_partants(jour, r, c, arrivee_connue=None, chercher_arrivee=True):
     data = get_json(f"{API}/{jour}/R{r}/C{c}/participants?specialisation=INTERNET")
     partants = []
     for p in data.get("participants", []):
@@ -136,7 +160,7 @@ def lire_partants(jour, r, c):
             "oeilleres": p.get("oeilleres") or "", "driverChange": bool(p.get("driverChange")),
         })
     arrivee = sorted((p for p in partants if p.get("ordreArrivee")), key=lambda p: p["ordreArrivee"])
-    arrivee = [p["num"] for p in arrivee] or arrivee_course(jour, r, c)
+    arrivee = [p["num"] for p in arrivee] or arrivee_connue or (arrivee_course(jour, r, c) if chercher_arrivee else [])
     for p in partants:
         p.pop("ordreArrivee", None)
     return partants, arrivee[:5]
@@ -231,13 +255,13 @@ def rapports_probables(jour, r, c, pari):
 DEFINITIFS_CACHE = {}
 
 
-def details_course(jour, r, c, pari):
+def details_course(jour, r, c, pari, partie=True):
     if DEMO:
         partants, arrivee = demo_partants()
         probables = demo_probables(partants, pari)
         definitifs = {}
     else:
-        partants, arrivee = lire_partants(jour, r, c)
+        partants, arrivee = lire_partants(jour, r, c, chercher_arrivee=partie)   # pas d'arrivée à chercher avant le départ
         ajouter_performances(partants, jour, r, c)
         probables = rapports_probables(jour, r, c, pari) if len(arrivee) < 3 else None
         definitifs = {}
@@ -285,36 +309,48 @@ def course_proche(courses, heure, pari):
 
 
 def bilan_jour(jour, heure, pari):
+    """Renvoie (fait, course). fait = False quand il faudra redemander ce jour plus tard (PMU saturé, résultats pas encore publiés)."""
+    recent = (datetime.now() - datetime.strptime(jour, "%d%m%Y")).days <= 2
     try:
         if jour not in PROG_CACHE:
             PROG_CACHE[jour] = liste_courses(jour)
         c = course_proche(PROG_CACHE[jour], heure, pari)
         if not c:
-            return None
+            return True, None
         cle = (jour, c["r"], c["c"])
         if cle not in JOUR_CACHE:
-            partants, arrivee = lire_partants(jour, c["r"], c["c"])
+            partants, arrivee = lire_partants(jour, c["r"], c["c"], arrivee_connue=c.get("arrivee"))
             rap = rapports_definitifs(jour, c["r"], c["c"])
             if not rap or len(arrivee) < 3:
-                return None
+                return (not recent), None
             ajouter_performances(partants, jour, c["r"], c["c"])
             JOUR_CACHE[cle] = {"date": jour, "r": c["r"], "c": c["c"], "hippodrome": c["hippodrome"],
                                "libelle": c["libelle"], "heure": c["heure"], "mini": c["mini"],
                                "distance": c.get("distance"), "discipline": c.get("discipline"),
                                "partants": partants, "arrivee": arrivee, "rapports": rap}
-        return JOUR_CACHE[cle]
+            if len(JOUR_CACHE) > 600:
+                JOUR_CACHE.pop(next(iter(JOUR_CACHE)))
+        return True, JOUR_CACHE[cle]
+    except urllib.error.HTTPError as e:
+        return (e.code == 404 and not recent), None      # 404 : programme introuvable pour ce jour
     except Exception:
-        return None          # pas mis en cache : on réessaiera
+        return False, None
 
 
-def bilan(jours, heure, pari, debut=1):
-    """Courses des jours passés, du jour « debut » (1 = hier) sur « jours » jours."""
-    if DEMO:
-        return demo_bilan(debut + jours - 1)[debut - 1:]
-    dates = [(datetime.now() - timedelta(days=i)).strftime("%d%m%Y") for i in range(debut, debut + jours)]
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        res = list(ex.map(lambda d: bilan_jour(d, heure, pari), dates))
-    return [x for x in res if x]
+def bilan(dates, heure, pari):
+    """Courses passées pour une liste de dates JJMMAAAA : {"resultats": {date: course ou None}, "sature": bool}.
+    Seuls les jours traités figurent dans « resultats » ; les autres seront redemandés."""
+    resultats = {}
+    for d in dates:
+        if DEMO:
+            resultats[d] = demo_jour((datetime.now() - datetime.strptime(d, "%d%m%Y")).days)
+            continue
+        if time.time() < PMU_ETAT["pause"]:
+            return {"resultats": resultats, "sature": True}
+        fait, course = bilan_jour(d, heure, pari)
+        if fait:
+            resultats[d] = course
+    return {"resultats": resultats, "sature": time.time() < PMU_ETAT["pause"]}
 
 
 # ------------------------------------------------------------------ mode démo
@@ -450,33 +486,30 @@ def demo_definitifs(partants, arr, rnd):
     }
 
 
-def demo_bilan(jours):
-    """Jours passés fictifs : arrivée tirée au sort selon les cotes, rapports ~ 70-75 % du juste prix."""
-    out = []
-    for i in range(1, jours + 1):
-        rnd = random.Random(1000 + i)
-        d = datetime.now() - timedelta(days=i)
-        partants = []
-        for n, nom, mus, matin, drv, crs, vic, pl in DEMO_CHEVAUX[:rnd.randint(13, 16)]:
-            cote = round(matin * rnd.uniform(0.5, 1.8), 1)
-            partants.append({"num": n, "nom": nom, "partant": True, "musique": mus, "driver": drv,
-                             "courses": crs, "victoires": vic, "places": pl,
-                             "coteMatin": round(cote * rnd.uniform(0.85, 1.15), 1), "coteDirect": cote})
-        demo_extras(partants, i)
-        reste, arr = dict(_probas(partants)), []
-        for _ in range(5):
-            x, acc = rnd.random() * sum(reste.values()), 0
-            for k, v in reste.items():
-                acc += v
-                if acc >= x:
-                    arr.append(k)
-                    reste.pop(k)
-                    break
-        out.append({"date": d.strftime("%d%m%Y"), "r": 1, "c": 3, "hippodrome": "VINCENNES", "libelle": "Course démo",
-                    "heure": int(d.replace(hour=13, minute=55).timestamp() * 1000), "mini": False,
-                    "distance": 2850, "discipline": "ATTELE",
-                    "partants": partants, "arrivee": arr, "rapports": demo_definitifs(partants, arr, rnd)})
-    return out
+def demo_jour(i):
+    """Jour passé fictif (il y a i jours) : arrivée tirée au sort selon les cotes, rapports ~ 70-75 % du juste prix."""
+    rnd = random.Random(1000 + i)
+    d = datetime.now() - timedelta(days=i)
+    partants = []
+    for n, nom, mus, matin, drv, crs, vic, pl in DEMO_CHEVAUX[:rnd.randint(13, 16)]:
+        cote = round(matin * rnd.uniform(0.5, 1.8), 1)
+        partants.append({"num": n, "nom": nom, "partant": True, "musique": mus, "driver": drv,
+                         "courses": crs, "victoires": vic, "places": pl,
+                         "coteMatin": round(cote * rnd.uniform(0.85, 1.15), 1), "coteDirect": cote})
+    demo_extras(partants, i)
+    reste, arr = dict(_probas(partants)), []
+    for _ in range(5):
+        x, acc = rnd.random() * sum(reste.values()), 0
+        for k, v in reste.items():
+            acc += v
+            if acc >= x:
+                arr.append(k)
+                reste.pop(k)
+                break
+    return {"date": d.strftime("%d%m%Y"), "r": 1, "c": 3, "hippodrome": "VINCENNES", "libelle": "Course démo",
+            "heure": int(d.replace(hour=13, minute=55).timestamp() * 1000), "mini": False,
+            "distance": 2850, "discipline": "ATTELE",
+            "partants": partants, "arrivee": arr, "rapports": demo_definitifs(partants, arr, rnd)}
 
 
 # ------------------------------------------------------------------ serveur web
@@ -514,16 +547,15 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/courses":
                 return self.envoyer(200, json.dumps({"date": jour, "demo": DEMO, "courses": liste_courses(jour)}))
             if u.path == "/api/bilan":
-                jours = max(1, min(20, int(q.get("jours", 15))))
-                debut = max(1, min(400, int(q.get("debut", 1))))
-                heure = q.get("heure", "13:55")
-                return self.envoyer(200, json.dumps({"jours": jours, "debut": debut, "heure": heure, "pari": pari,
-                                                     "courses": bilan(jours, heure, pari, debut)}))
+                dates = [d for d in q.get("dates", "").split(",") if len(d) == 8 and d.isdigit()][:12]
+                return self.envoyer(200, json.dumps(bilan(dates, q.get("heure", "13:55"), pari)))
             if u.path == "/api/course":
-                return self.envoyer(200, json.dumps(details_course(jour, int(q["r"]), int(q["c"]), pari)))
+                return self.envoyer(200, json.dumps(details_course(jour, int(q["r"]), int(q["c"]), pari, q.get("partie", "1") == "1")))
             return self.envoyer(404, json.dumps({"erreur": "introuvable"}))
         except urllib.error.HTTPError as e:
-            msg = "Programme pas encore publié par le PMU" if e.code in (204, 404) else f"Le PMU a répondu {e.code}"
+            msg = ("Programme pas encore publié par le PMU" if e.code in (204, 404)
+                   else f"Le PMU ne répond pas pour le moment (erreur {e.code}), sans doute trop de demandes d'affilée. Ça revient tout seul"
+                   if e.code in SATURE else f"Le PMU a répondu {e.code}")
             return self.envoyer(502, json.dumps({"erreur": msg}))
         except (urllib.error.URLError, socket.timeout) as e:
             return self.envoyer(502, json.dumps({"erreur": f"PMU injoignable ({getattr(e, 'reason', e)})"}))
@@ -917,7 +949,8 @@ async function rafraichir() {
   if (!courant) return;
   const demande = courant.r + "-" + courant.c + "-" + pari;
   try {
-    const r = await fetch(`/api/course?r=${courant.r}&c=${courant.c}&pari=${pari}`); const j = await r.json();
+    const partie = courant.heure && courant.heure <= Date.now() ? 1 : 0;
+    const r = await fetch(`/api/course?r=${courant.r}&c=${courant.c}&pari=${pari}&partie=${partie}`); const j = await r.json();
     if (!r.ok) throw new Error(j.erreur || "Données indisponibles");
     if (demande !== courant.r + "-" + courant.c + "-" + pari) return;   // l'utilisateur a changé entre-temps
     donnees = j; $("erreur").hidden = true;
@@ -1162,7 +1195,7 @@ const estDesordre = l => /d[ée]sordre/i.test(l);
 const estOrdre = (t, l) => !estDesordre(l) && (/ordre/i.test(l) || ORDONNES.has(t));
 function calerK(t) {
   const A = [], O = [], kind = PARIS[t].kind;
-  for (const j of (bilanCache[t] || {}).courses || []) {
+  for (const j of coursesChargees(t)) {
     const P = j.partants.filter(c => c.partant), mk = marchePMU(P, {});
     for (const rap of j.rapports[t] || []) {
       const lib = rap.l.toLowerCase(); if (lib.includes("bonus")) continue;
@@ -1350,35 +1383,78 @@ function verdict(e, mise) {
 const bilanCache = {}; let bilanTimer = null, bilanAvance = "";
 const periode = () => +$("periode").value;
 try { const pe = localStorage.getItem("ml_periode"); if (pe) $("periode").value = pe; } catch (e) {}
-// Les jours passés sont chargés par tranches de 15 jours, pour afficher les résultats au fur et à mesure
+
+// Les courses passées sont gardées dans le téléphone : chaque jour n'est demandé au PMU qu'une seule fois.
+const memoire = {
+  db: null,
+  ouvrir() {
+    if (this.db !== null) return this.db;
+    this.db = new Promise(res => {
+      try {
+        const rq = indexedDB.open("multilive-v2", 1);
+        rq.onupgradeneeded = () => rq.result.createObjectStore("jours");
+        rq.onsuccess = () => res(rq.result); rq.onerror = () => res(null); rq.onblocked = () => res(null);
+      } catch (e) { res(null); }
+    });
+    return this.db;
+  },
+  async lire(t) {                       // -> Map(date -> course ou null)
+    const db = await this.ouvrir(), out = new Map(); if (!db) return out;
+    return new Promise(res => {
+      try {
+        const rq = db.transaction("jours").objectStore("jours").openCursor(IDBKeyRange.bound(t + "|", t + "|￿"));
+        rq.onsuccess = () => { const c = rq.result; if (!c) return res(out); out.set(String(c.key).split("|")[1], c.value); c.continue(); };
+        rq.onerror = () => res(out);
+      } catch (e) { res(out); }
+    });
+  },
+  async ecrire(t, resultats, garder) {  // enregistre les nouveaux jours, efface ceux qui sortent de la période la plus longue
+    const db = await this.ouvrir(); if (!db) return;
+    try {
+      const st = db.transaction("jours", "readwrite").objectStore("jours");
+      for (const [d, v] of Object.entries(resultats)) st.put(v, t + "|" + d);
+      st.openCursor(IDBKeyRange.bound(t + "|", t + "|￿")).onsuccess = e => { const c = e.target.result; if (!c) return;
+        if (!garder.has(String(c.key).split("|")[1])) c.delete(); c.continue(); };
+    } catch (e) {}
+  },
+};
+const jjmmaaaa = d => String(d.getDate()).padStart(2, "0") + String(d.getMonth() + 1).padStart(2, "0") + d.getFullYear();
+function datesPassees(n) { const out = []; for (let i = 1; i <= n; i++) { const d = new Date(); d.setDate(d.getDate() - i); out.push(jjmmaaaa(d)); } return out; }
+function coursesChargees(t) { const c = bilanCache[t]; return c ? [...c.jours.values()].filter(Boolean) : []; }
+
+// Chargement par tranches de 10 jours, résultats affichés au fur et à mesure
 async function chargerBilan() {
   const t = pari;
   $("bTitre").textContent = `Test sur les courses passées — ${PARIS[t].nom}`;
-  const c = bilanCache[t] || (bilanCache[t] = {jours: 0, courses: [], enCours: false});
+  const c = bilanCache[t] || (bilanCache[t] = {jours: null, enCours: false});
   const afficher = () => { if (t === pari) { calerK(t); calculerBilan(); calculer(); } };
-  if (c.jours >= periode()) { bilanAvance = ""; afficher(); return; }
   if (c.enCours) return;
   c.enCours = true;
-  if (!c.jours) { $("bCartes").innerHTML = ""; $("bCorps").innerHTML = ""; }
   try {
-    while (t === pari && c.jours < periode()) {
-      bilanAvance = `Chargement des courses passées : ${c.jours} jours sur ${periode()}… `;
-      if (c.jours) afficher(); else $("bEtat").textContent = bilanAvance + "(quelques secondes par tranche de 15 jours)";
-      const n = Math.min(15, periode() - c.jours);
-      const r = await fetch(`/api/bilan?debut=${c.jours + 1}&jours=${n}&heure=${HEURE_CIBLE}&pari=${t}`); const j = await r.json();
+    if (!c.jours) { $("bCartes").innerHTML = ""; $("bCorps").innerHTML = ""; $("bEtat").textContent = "Chargement…"; c.jours = await memoire.lire(t); }
+    let arret = ""; const essayes = new Set();
+    while (t === pari) {
+      const voulues = datesPassees(periode()), manque = voulues.filter(d => !c.jours.has(d) && !essayes.has(d));
+      if (!manque.length) break;
+      bilanAvance = `Chargement des courses passées : ${voulues.length - manque.length} jours sur ${voulues.length}… `;
+      afficher();
+      const lot = manque.slice(0, 10);
+      const r = await fetch(`/api/bilan?dates=${lot.join(",")}&heure=${HEURE_CIBLE}&pari=${t}`); const j = await r.json();
       if (!r.ok) throw new Error(j.erreur || "Test indisponible");
-      c.courses.push(...j.courses); c.jours += n;
+      const faits = Object.keys(j.resultats);
+      for (const d of lot) essayes.add(d);
+      for (const d of faits) c.jours.set(d, j.resultats[d]);
+      memoire.ecrire(t, j.resultats, new Set(datesPassees(190)));
+      if (j.sature) { arret = "Le PMU limite les demandes pour le moment : le chargement reprendra à la prochaine ouverture de l'appli. "; break; }
     }
-    bilanAvance = ""; afficher();
+    bilanAvance = arret; afficher();
   } catch (e) {
-    bilanAvance = ""; if (t === pari) { afficher(); $("bEtat").textContent = "Chargement interrompu : " + e.message + ". Rouvre l'appli pour le relancer. " + $("bEtat").textContent; }
+    bilanAvance = "Chargement interrompu (" + e.message + "). Il reprendra à la prochaine ouverture. "; afficher();
   } finally { c.enCours = false; }
 }
 function calculerBilan() {
-  const t = pari, cache = bilanCache[t]; if (!cache) return;
-  const auj = new Date(); auj.setHours(0, 0, 0, 0);
-  const age = j => Math.round((auj - new Date(+j.date.slice(4), +j.date.slice(2, 4) - 1, +j.date.slice(0, 2))) / 86400000);
-  const data = cache.courses.filter(j => age(j) <= periode());
+  const t = pari, cache = bilanCache[t]; if (!cache || !cache.jours) return;
+  const data = datesPassees(periode()).map(d => cache.jours.get(d)).filter(Boolean);
   const w = poids(), k = tailleTicket(t), mise = maMise(), multi = t === "MULTI", N = nbTickets();
   const cles = ["prudent", "equilibre", "outsiders", "fav"], st = {};
   for (const c of cles) st[c] = {n: 0, g: 0, mise: 0, ret: 0};
@@ -1408,7 +1484,7 @@ function calculerBilan() {
   $("bCorps").innerHTML = lignes.join("");
   $("bEtat").textContent = bilanAvance + (st.fav.n
     ? `${st.fav.n} courses analysées, ${PARIS[t].nom}${multi ? " en " + k : ""} ${N > 1 ? ", " + N + " tickets" : ""} à ${euro(mise)} ${N > 1 ? "chacun" : "par jour"} : chaque jour, la course proposant ce pari la plus proche de ${HEURE_CIBLE.replace(":", "h")}. Gains calculés avec les vrais rapports du PMU. Calcul fait avec les cotes finales : en vrai, quelques minutes avant le départ, c'est un peu moins bon.`
-    : "Aucune course exploitable pour ce pari sur la période.");
+    : (bilanAvance ? "" : "Aucune course exploitable pour ce pari sur la période."));
 }
 
 function spark(h) {
