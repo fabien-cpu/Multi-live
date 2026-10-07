@@ -123,6 +123,11 @@ def paris_course(course):
     return out, mini
 
 
+def est_handicap(c):
+    """Course à handicap, d'après la catégorie du PMU (HANDICAP, HANDICAP_DIVISE…) ou, à défaut, le texte des conditions."""
+    return "HANDICAP" in str(c.get("categorieParticularite") or "").upper() or "handicap" in str(c.get("conditions") or "").lower()[:200]
+
+
 PROG_DIRECT = {}        # jour -> (heure de lecture, courses) : le programme du jour est gardé 30 secondes
 
 
@@ -144,7 +149,7 @@ def liste_courses(jour):
                 "libelle": c.get("libelle", ""), "heure": c.get("heureDepart"),
                 "discipline": c.get("discipline", ""), "distance": c.get("distance"),
                 "partants": c.get("nombreDeclaresPartants"), "paris": paris, "mini": mini,
-                "statut": c.get("statut", ""),
+                "statut": c.get("statut", ""), "handicap": est_handicap(c),
                 "arrivee": [n for g in (c.get("ordreArrivee") or []) for n in (g if isinstance(g, list) else [g])][:5],
             })
     out.sort(key=lambda x: x["heure"] or 0)
@@ -363,6 +368,7 @@ def bilan_jour(jour, heure, pari):
             JOUR_CACHE[cle] = {"date": jour, "r": c["r"], "c": c["c"], "hippodrome": c["hippodrome"],
                                "libelle": c["libelle"], "heure": c["heure"], "mini": c["mini"],
                                "distance": c.get("distance"), "discipline": c.get("discipline"),
+                               "handicap": bool(c.get("handicap")),
                                "partants": partants, "arrivee": arrivee, "rapports": rap}
             if len(JOUR_CACHE) > 600:
                 JOUR_CACHE.pop(next(iter(JOUR_CACHE)))
@@ -390,6 +396,26 @@ def bilan(dates, heure, pari):
     return {"resultats": resultats, "sature": time.time() < PMU_ETAT["pause"]}
 
 
+def types_jours(dates):
+    """Handicap ou non, pour toutes les courses de chaque date : {"resultats": {date: {"r-c": bool}}, "sature": bool}.
+    Une seule demande au PMU par jour (le programme). Sert à compléter les courses déjà gardées sur le téléphone."""
+    resultats = {}
+    CONTEXTE.fond = True
+    for d in dates:
+        if DEMO:
+            resultats[d] = {f"1-{c}": (int(d[:2]) + c) % 3 == 0 for c in (3, 11, 15, 17)}
+            continue
+        if time.time() < PMU_ETAT["pause"]:
+            break
+        try:
+            if d not in PROG_CACHE:
+                PROG_CACHE[d] = liste_courses(d)
+            resultats[d] = {f"{c['r']}-{c['c']}": bool(c.get("handicap")) for c in PROG_CACHE[d]}
+        except Exception:
+            pass
+    return {"resultats": resultats, "sature": time.time() < PMU_ETAT["pause"]}
+
+
 # ------------------------------------------------------------------ mode démo
 
 _demo_state = {}
@@ -406,12 +432,12 @@ def demo_programme(jour):
     petit = [{"t": t, "base": 1} for t in ("SIMPLE_GAGNANT", "SIMPLE_PLACE", "COUPLE_GAGNANT", "COUPLE_PLACE", "TRIO")]
     return [
         {"r": 1, "c": 1, "hippodrome": "VINCENNES", "libelle": "PRIX DE BAZOCHES", "heure": ms(base - timedelta(minutes=65)),
-         "discipline": "ATTELE", "distance": 2700, "partants": 12, "paris": petit, "mini": False, "statut": "FIN_COURSE"},
+         "discipline": "ATTELE", "distance": 2700, "partants": 12, "paris": petit, "mini": False, "statut": "FIN_COURSE", "handicap": False},
         {"r": 1, "c": 3, "hippodrome": "VINCENNES", "libelle": "PRIX DE RUNGIS (démo)", "heure": ms(base),
-         "discipline": "ATTELE", "distance": 2850, "partants": 16, "paris": DEMO_PARIS, "mini": False, "statut": "PROGRAMMEE"},
+         "discipline": "ATTELE", "distance": 2850, "partants": 16, "paris": DEMO_PARIS, "mini": False, "statut": "PROGRAMMEE", "handicap": False},
         {"r": 2, "c": 5, "hippodrome": "LONGCHAMP", "libelle": "PRIX DES ETANGS", "heure": ms(base + timedelta(minutes=80)),
          "discipline": "PLAT", "distance": 1600, "partants": 11, "paris": petit + [{"t": "MULTI", "base": 3}, {"t": "PICK5", "base": 1}],
-         "mini": True, "statut": "PROGRAMMEE"},
+         "mini": True, "statut": "PROGRAMMEE", "handicap": True},
     ]
 
 
@@ -561,6 +587,7 @@ def demo_pmu(chemin):
             reu["courses"].append({"numOrdre": c["c"], "libelle": c["libelle"], "heureDepart": c["heure"],
                                    "discipline": c["discipline"], "distance": c["distance"],
                                    "nombreDeclaresPartants": c["partants"], "statut": c["statut"],
+                                   "categorieParticularite": "HANDICAP_DIVISE" if c["handicap"] else "COURSE_A_CONDITIONS",
                                    "paris": [{"typePari": "E_" + ("MINI_MULTI" if p["t"] == "MULTI" and c["mini"] else p["t"]),
                                               "miseBase": int(p["base"] * 100)} for p in c["paris"]]})
         return {"programme": {"reunions": list(reunions.values())}}
@@ -632,6 +659,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/bilan":
                 dates = [d for d in q.get("dates", "").split(",") if len(d) == 8 and d.isdigit()][:12]
                 return self.envoyer(200, json.dumps(bilan(dates, q.get("heure", "13:55"), pari)))
+            if u.path == "/api/types":
+                dates = [d for d in q.get("dates", "").split(",") if len(d) == 8 and d.isdigit()][:20]
+                return self.envoyer(200, json.dumps(types_jours(dates)))
             if u.path == "/api/course":
                 return self.envoyer(200, json.dumps(details_course(jour, int(q["r"]), int(q["c"]), pari, q.get("partie", "1") == "1")))
             return self.envoyer(404, json.dumps({"erreur": "introuvable"}))
@@ -827,6 +857,9 @@ table.btab{min-width:620px}
 </header>
 
 <div class="choix">
+  <div class="champ"><label for="typeC">Type de course</label>
+    <select id="typeC"><option value="tous">Toutes les courses</option><option value="attele">Trot attelé</option><option value="monte">Trot monté</option>
+      <option value="plat">Plat</option><option value="obstacle">Obstacles</option><option value="handicap">Handicaps</option><option value="sanshandicap">Sans handicap</option></select></div>
   <div class="champ large"><label for="choixCourse">Course</label><select id="choixCourse"></select></div>
   <div class="champ"><label for="pari">Pari</label><select id="pari"></select></div>
   <div class="champ"><label for="style">Style</label>
@@ -1014,6 +1047,7 @@ async function directCourses() {
     paris.sort((a, b) => ordre.indexOf(a.t) - ordre.indexOf(b.t));
     out.push({r: reu.numOfficiel, c: c.numOrdre, hippodrome: (reu.hippodrome || {}).libelleCourt || "", libelle: c.libelle || "",
               heure: c.heureDepart, discipline: c.discipline || "", distance: c.distance, partants: c.nombreDeclaresPartants,
+              handicap: /HANDICAP/i.test(c.categorieParticularite || "") || /handicap/i.test(String(c.conditions || "").slice(0, 200)),
               paris, mini, statut: c.statut || "", arrivee: aplatir(c.ordreArrivee)});
   }
   out.sort((a, b) => (a.heure || 0) - (b.heure || 0));
@@ -1083,6 +1117,30 @@ async function viaServeur(url, defaut) {
   return j;
 }
 
+// ---------- type de course : un seul choix, qui trie à la fois les courses du jour et le test sur les courses passées
+const TYPES_C = {tous: "Toutes les courses", attele: "Trot attelé", monte: "Trot monté", plat: "Plat", obstacle: "Obstacles", handicap: "Handicaps", sanshandicap: "Sans handicap"};
+try { const ty = localStorage.getItem("ml_type"); if (ty && TYPES_C[ty]) $("typeC").value = ty; } catch (e) {}
+const nomDisc = d => { d = (d || "").toUpperCase(); return /ATTELE/.test(d) ? "Trot attelé" : /MONTE/.test(d) ? "Trot monté" : /PLAT/.test(d) ? "Plat" : /HAIE|STEEPLE|CROSS/.test(d) ? "Obstacles" : "Autre"; };
+function typeOk(c) {                 // c = course du jour ou course passée
+  const v = $("typeC").value;
+  if (v === "tous") return true;
+  if (v === "handicap") return c.handicap === true;
+  if (v === "sanshandicap") return c.handicap === false;
+  return nomDisc(c.discipline) === TYPES_C[v];
+}
+function procheDe1355(pool) {
+  const [h, m] = HEURE_CIBLE.split(":").map(Number), cible = new Date(); cible.setHours(h, m, 0, 0);
+  let choix = pool[0];
+  for (const c of pool) if (Math.abs((c.heure || 0) - cible) < Math.abs((choix.heure || 0) - cible)) choix = c;
+  return choix;
+}
+$("typeC").addEventListener("change", e => {
+  try { localStorage.setItem("ml_type", e.target.value); } catch (_) {}
+  const ok = courses.filter(typeOk);
+  if (ok.length && courant && !typeOk(courant)) { const avec = ok.filter(c => offre(c, prefPari)); remplirCourses(); choisir(procheDe1355(avec.length ? avec : ok)); }
+  else { remplirCourses(); calculerBilan(); }
+});
+
 // ---------- programme
 async function chargerProgramme() {
   const j = await avecSecours(() => viaServeur("/api/courses", "Programme indisponible"), directCourses);
@@ -1090,17 +1148,19 @@ async function chargerProgramme() {
   courses = j.courses.filter(c => (c.paris || []).length);
   remplirCourses();
   // course par défaut : celle qui propose mon pari habituel, la plus proche de 13h55
-  const [h, m] = HEURE_CIBLE.split(":").map(Number);
-  const cible = new Date(); cible.setHours(h, m, 0, 0);
-  const avec = courses.filter(c => offre(c, prefPari));
-  const pool = avec.length ? avec : courses;
-  let choix = pool[0];
-  for (const c of pool) if (Math.abs((c.heure || 0) - cible) < Math.abs((choix.heure || 0) - cible)) choix = c;
+  const ok = courses.filter(typeOk), base = ok.length ? ok : courses;
+  const avec = base.filter(c => offre(c, prefPari));
+  const choix = procheDe1355(avec.length ? avec : base);
   if (choix) choisir(choix);
 }
 function remplirCourses() {
   const sel = $("choixCourse"); sel.innerHTML = "";
-  for (const c of courses) {
+  const ok = courses.filter(typeOk);
+  if (!ok.length && courses.length) {       // rien de ce type aujourd'hui : on le dit, et on laisse tout le programme
+    const o = document.createElement("option"); o.disabled = true; o.value = "";
+    o.textContent = `Aucune course « ${TYPES_C[$("typeC").value]} » aujourd'hui : voici toutes les courses`; sel.appendChild(o);
+  }
+  for (const c of (ok.length ? ok : courses)) {
     const o = document.createElement("option");
     o.value = c.r + "-" + c.c;
     o.textContent = `${c.heure ? hhmm(c.heure) : "--:--"}  R${c.r}C${c.c} ${c.hippodrome}${offre(c, prefPari) ? "  · " + nomPari(prefPari, c) : ""}`;
@@ -1124,7 +1184,7 @@ function choisir(c) {
   pari = offre(c, prefPari) ? prefPari : offre(c, pari) ? pari : offre(c, "MULTI") ? "MULTI" : c.paris[0].t;
   sel.value = pari;
   $("cNom").textContent = `R${c.r}C${c.c} — ${c.libelle || c.hippodrome}`;
-  const bits = [c.hippodrome, c.discipline && c.discipline.toLowerCase(), c.distance && c.distance + " m",
+  const bits = [c.hippodrome, c.discipline && nomDisc(c.discipline).toLowerCase(), c.handicap && "handicap", c.distance && c.distance + " m",
                 c.partants && c.partants + " partants"].filter(Boolean);
   $("cMeta").textContent = (c.heure ? "Départ " + hhmm(c.heure) + " · " : "") + bits.join(" · ");
   majFormule(); rafraichir(); chargerBilan();
@@ -1710,10 +1770,30 @@ async function chargerBilan() {
       memoire.ecrire(t, nouveaux, garder);
       if (j.sature) { arret = "Le PMU limite les demandes pour le moment : le chargement reprendra à la prochaine ouverture de l'appli. "; break; }
     }
+    if (!arret) await completerTypes(t, c, garder, afficher);
     bilanAvance = arret; afficher();
   } catch (e) {
     bilanAvance = "Chargement interrompu (" + e.message + "). Il reprendra à la prochaine ouverture. "; afficher();
   } finally { c.enCours = false; }
+}
+// Les courses gardées sur le téléphone avant l'arrivée du choix « Handicaps » ne disent pas si elles en étaient un :
+// on le demande au serveur, une seule fois (une demande au PMU par jour, pas par course), puis c'est gardé.
+async function completerTypes(t, c, garder, afficher) {
+  const essayes = new Set(), total = [...c.jours.values()].filter(j => j && j.handicap === undefined).length;
+  try {
+    while (t === pari) {
+      const manque = [...c.jours].filter(([, j]) => j && j.handicap === undefined && !essayes.has(j.date));
+      if (!manque.length) break;
+      const dates = [...new Set(manque.map(([, j]) => j.date))].slice(0, 15);
+      dates.forEach(d => essayes.add(d));
+      bilanAvance = `Lecture du type des courses (handicap ou non) : encore ${manque.length} sur ${total}… `; afficher();
+      const r = await fetch(`/api/types?dates=${dates.join(",")}`), j = await r.json(); if (!r.ok) break;
+      const maj = {};
+      for (const [id, x] of manque) { const h = (j.resultats[x.date] || {})[x.r + "-" + x.c]; if (h !== undefined) { x.handicap = !!h; maj[id] = x; } }
+      memoire.ecrire(t, maj, garder);
+      if (j.sature) break;
+    }
+  } catch (e) {}
 }
 // Chaque jour passé n'est rejoué qu'une fois par réglage (pari, formule, nombre de tickets, poids des analyses) :
 // le résultat est gardé pour 1 € de mise, donc changer la mise ou le style ne recalcule rien.
@@ -1747,8 +1827,7 @@ function rejouerJour(t, k, N, w, j, comp) {
   const res = {};
   for (const c of ["prudent", "equilibre", "outsiders"]) res[c] = jouer(mod, c);
   res.fav = jouer({p: mod.marche, marche: mod.marche}, "prudent");       // les favoris des parieurs, sans analyse
-  const d = (j.discipline || "").toUpperCase();
-  res.type = {disc: /ATTELE/.test(d) ? "Trot attelé" : /MONTE/.test(d) ? "Trot monté" : /PLAT/.test(d) ? "Plat" : /HAIE|STEEPLE|CROSS/.test(d) ? "Obstacles" : "Autre",
+  res.type = {disc: nomDisc(j.discipline),
               nb: P.length <= 12 ? "12 partants ou moins" : P.length <= 15 ? "13 à 15 partants" : "16 partants ou plus",
               fav: (m => m >= .3 ? "Favori net (30 % ou plus)" : m >= .2 ? "Favori moyen (20 à 30 %)" : "Course ouverte (moins de 20 %)")(Math.max(...mod.marche))};
   return res;
@@ -1759,7 +1838,7 @@ async function calculerBilan() {
   const w = poids(), k = tailleTicket(t), N = nbTickets(), multi = t === "MULTI";
   const cle = [t, k, N, CURSEURS.map(c => $(c).value).join("-")].join("|");
   if (bilanMemo.cle !== cle) { bilanMemo.cle = cle; bilanMemo.jours = new Map(); }
-  const liste = coursesTest(cache, periode(), heuresTest());
+  const liste = coursesTest(cache, periode(), heuresTest()).filter(x => typeOk(x.j));
   const aFaire = liste.filter(x => !bilanMemo.jours.has(x.id));
   // calcul par tranches courtes, en rendant la main à l'écran entre deux
   let debut = performance.now(), faits = 0;
@@ -1776,7 +1855,7 @@ async function calculerBilan() {
   afficherBilan(t, k, N, multi, liste);
 }
 function afficherBilan(t, k, N, multi, liste) {
-  const mise = maMise(), cles = ["prudent", "equilibre", "outsiders", "fav"], st = {}, filtre = $("joues").value;
+  const mise = maMise(), cles = ["prudent", "equilibre", "outsiders", "fav"], st = {}, filtre = $("joues").value, tc = $("typeC").value;
   const vide = () => ({n: 0, g: 0, mise: 0, ret: 0});
   for (const c of cles) st[c] = vide();
   const types = {}, lignes = [], cell = g => `<td class="${g ? "tr-down" : ""}">${g ? "✓ +" + euro(g) : "✗"}</td>`;
@@ -1788,7 +1867,7 @@ function afficherBilan(t, k, N, multi, liste) {
     if (filtre !== "tous") { if (part === null) { sansVerdict++; continue; } if (part < (filtre === "favorable" ? 1 : 0.85)) { ecartes++; continue; } }
     for (const c of cles) { const g = res[c].g * mise; st[c].n++; st[c].mise += mise * res[c].nb; if (g) { st[c].g++; st[c].ret += g; } }
     const verd = part === null ? "Verdict inconnu" : part >= 1 ? "Verdict favorable" : part >= .85 ? "Verdict limite" : "Verdict défavorable";
-    for (const [grp, nom] of [["Discipline", res.type.disc], ["Nombre de partants", res.type.nb], ["Force du favori", res.type.fav], ["Verdict de l'appli", verd]]) {
+    for (const [grp, nom] of [["Discipline", res.type.disc], ["Handicap", j.handicap === true ? "Handicap" : j.handicap === false ? "Sans handicap" : "Non renseigné"], ["Nombre de partants", res.type.nb], ["Force du favori", res.type.fav], ["Verdict de l'appli", verd]]) {
       const x = (types[grp] = types[grp] || {})[nom] = (types[grp][nom] || {a: vide(), f: vide()});
       for (const [o, c] of [[x.a, style], [x.f, "fav"]]) { o.n++; o.mise += res[c].nb; o.ret += res[c].g; }
     }
@@ -1812,8 +1891,8 @@ function afficherBilan(t, k, N, multi, liste) {
   const tri = filtre === "tous" ? "" : ` Courses écartées par le filtre : ${ecartes}${sansVerdict ? `, plus ${sansVerdict} sans verdict` : ""}.`;
   const quelles = heuresTest().length > 1 ? "jusqu'à 4 courses par jour proposant ce pari, du matin au soir" : `chaque jour, la course proposant ce pari la plus proche de ${HEURE_CIBLE.replace(":", "h")}`;
   $("bEtat").textContent = bilanAvance + (st.fav.n
-    ? `${st.fav.n} courses jouées, ${PARIS[t].nom}${multi ? " en " + k : ""} ${N > 1 ? ", " + N + " tickets" : ""} à ${euro(mise)} ${N > 1 ? "chacun" : "par course"} : ${quelles}.${tri} Gains calculés avec les vrais rapports du PMU et les cotes finales : en vrai, quelques minutes avant le départ, c'est un peu moins bon.`
-    : (bilanAvance ? "" : filtre === "tous" ? "Aucune course exploitable pour ce pari sur la période." : `Aucune course ne passe ce filtre sur la période.${tri}`));
+    ? `${st.fav.n} courses jouées, ${PARIS[t].nom}${multi ? " en " + k : ""} ${N > 1 ? ", " + N + " tickets" : ""} à ${euro(mise)} ${N > 1 ? "chacun" : "par course"} : ${quelles}${tc === "tous" ? "" : ", en gardant seulement « " + TYPES_C[tc] + " »"}.${tri} Gains calculés avec les vrais rapports du PMU et les cotes finales : en vrai, quelques minutes avant le départ, c'est un peu moins bon.`
+    : (bilanAvance ? "" : tc !== "tous" ? `Aucune course « ${TYPES_C[tc]} » chargée pour ce pari sur la période. Essaie « 6 derniers mois » et « 4, du matin au soir ».` : filtre === "tous" ? "Aucune course exploitable pour ce pari sur la période." : `Aucune course ne passe ce filtre sur la période.${tri}`));
 }
 $("bCorps").closest("details").addEventListener("toggle", e => { if (e.target.open && e.target._lignes) $("bCorps").innerHTML = e.target._lignes.join(""); });
 
@@ -1833,12 +1912,12 @@ async function chercherReglage() {
   const t = pari, cache = bilanCache[t], box = $("optimRes"); box.hidden = false;
   const k = tailleTicket(t), N = nbTickets();
   const jeu = [];
-  for (const {j} of (cache && cache.jours ? coursesTest(cache, periode(), heuresTest()) : []).reverse()) {          // du plus ancien au plus récent
+  for (const {j} of (cache && cache.jours ? coursesTest(cache, periode(), heuresTest()).filter(x => typeOk(x.j)) : []).reverse()) {          // du plus ancien au plus récent
     const P = j.partants.filter(c => c.partant), arr = j.arrivee.slice(0, 3).map(nm => P.findIndex(c => c.num === nm));
     if (P.length < Math.max(k + 1, 5) || arr.length < 3 || arr.some(i => i < 0)) continue;
     jeu.push({j, arr, comp: composantes(P, {}, ctxJour(j))});
   }
-  if (jeu.length < 40) { box.innerHTML = `<b class="t">Pas assez de courses</b><span class="sub">Il en faut au moins 40 pour régler puis vérifier (${jeu.length} chargées). Choisis une période plus longue ou « 4 courses par jour », et attends la fin du chargement.</span>`; return; }
+  if (jeu.length < 40) { box.innerHTML = `<b class="t">Pas assez de courses</b><span class="sub">Il en faut au moins 40 pour régler puis vérifier (${jeu.length} chargées${$("typeC").value === "tous" ? "" : " dans « " + TYPES_C[$("typeC").value] + " »"}). Choisis une période plus longue ou « 4 courses par jour », et attends la fin du chargement.</span>`; return; }
   box.innerHTML = '<span class="sub">Recherche en cours…</span>';
   await new Promise(r => setTimeout(r, 30));
   const coupe = Math.round(jeu.length * 0.6), regl = jeu.slice(0, coupe), verif = jeu.slice(coupe);
