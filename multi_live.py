@@ -56,22 +56,38 @@ AVEC_PROBABLES = {"SIMPLE_PLACE", "COUPLE_GAGNANT", "COUPLE_PLACE", "COUPLE_ORDR
 
 # ------------------------------------------------------------------ accès PMU
 
-# Le PMU coupe l'accès (erreur 504) quand on lui envoie trop de demandes d'un coup :
-# on espace donc toutes les demandes, et on suspend le chargement des courses passées dès qu'il sature.
+# Le PMU coupe l'accès (erreur 504) quand on lui envoie trop de demandes d'un coup : on espace donc les demandes.
+# Deux files : les cotes en direct passent tout de suite ; le chargement des courses passées (« fond »)
+# est plus lent et s'efface dès qu'une demande en direct arrive, pour ne jamais la faire attendre.
 PMU_LOCK = threading.Lock()
-PMU_ETAT = {"prochain": 0.0, "pause": 0.0}
-ESPACE = 0.25                     # secondes entre deux demandes au PMU (4 par seconde au plus)
+PMU_ETAT = {"direct": 0.0, "fond": 0.0, "dernier_direct": 0.0, "pause": 0.0}
+ESPACE_DIRECT = 0.05              # secondes entre deux demandes en direct
+ESPACE_FOND = 0.25                # secondes entre deux demandes de courses passées
 SATURE = (429, 500, 502, 503, 504)
+CONTEXTE = threading.local()      # CONTEXTE.fond = True pendant le chargement des courses passées
 
 
 def get_json(url, essais=2):
+    fond = getattr(CONTEXTE, "fond", False)
     for essai in range(essais):
-        with PMU_LOCK:
-            maintenant = time.time()
-            attente = PMU_ETAT["prochain"] - maintenant
-            PMU_ETAT["prochain"] = max(maintenant, PMU_ETAT["prochain"]) + ESPACE
-        if attente > 0:
-            time.sleep(attente)
+        while True:
+            with PMU_LOCK:
+                maintenant = time.time()
+                if fond:
+                    libre = max(PMU_ETAT["fond"], PMU_ETAT["dernier_direct"] + 0.35)
+                    if libre <= maintenant:
+                        PMU_ETAT["fond"] = maintenant + ESPACE_FOND
+                        break
+                    attente = libre - maintenant
+                else:
+                    attente = PMU_ETAT["direct"] - maintenant
+                    PMU_ETAT["direct"] = max(maintenant, PMU_ETAT["direct"]) + ESPACE_DIRECT
+                    PMU_ETAT["dernier_direct"] = max(maintenant, PMU_ETAT["direct"])
+                    if attente <= 0:
+                        break
+            time.sleep(min(max(attente, 0.01), 1.0))
+            if not fond:
+                break
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=15) as r:
@@ -107,9 +123,15 @@ def paris_course(course):
     return out, mini
 
 
+PROG_DIRECT = {}        # jour -> (heure de lecture, courses) : le programme du jour est gardé 30 secondes
+
+
 def liste_courses(jour):
     if DEMO:
         return demo_programme(jour)
+    vu = PROG_DIRECT.get(jour)
+    if vu and time.time() - vu[0] < 30:
+        return vu[1]
     data = get_json(f"{API}/{jour}?specialisation=INTERNET")
     out = []
     for reu in data.get("programme", {}).get("reunions", []):
@@ -126,6 +148,8 @@ def liste_courses(jour):
                 "arrivee": [n for g in (c.get("ordreArrivee") or []) for n in (g if isinstance(g, list) else [g])][:5],
             })
     out.sort(key=lambda x: x["heure"] or 0)
+    PROG_DIRECT.clear()
+    PROG_DIRECT[jour] = (time.time(), out)
     return out
 
 
@@ -253,6 +277,8 @@ def rapports_probables(jour, r, c, pari):
 
 
 DEFINITIFS_CACHE = {}
+COTES_DIRECT = {}       # (jour, r, c, partie) -> (heure de lecture, données) : absorbe les demandes rapprochées
+POOL = ThreadPoolExecutor(max_workers=4)
 
 
 def details_course(jour, r, c, pari, partie=True):
@@ -261,9 +287,19 @@ def details_course(jour, r, c, pari, partie=True):
         probables = demo_probables(partants, pari)
         definitifs = {}
     else:
-        partants, arrivee = lire_partants(jour, r, c, chercher_arrivee=partie)   # pas d'arrivée à chercher avant le départ
+        # les rapports probables sont demandés en même temps que les cotes, pas l'un après l'autre
+        fut = POOL.submit(rapports_probables, jour, r, c, pari) if pari in AVEC_PROBABLES else None
+        vu = COTES_DIRECT.get((jour, r, c, partie))
+        if vu and time.time() - vu[0] < 3:
+            partants, arrivee = json.loads(vu[1])
+        else:
+            partants, arrivee = lire_partants(jour, r, c, chercher_arrivee=partie)   # pas d'arrivée à chercher avant le départ
+            COTES_DIRECT.clear()
+            COTES_DIRECT[(jour, r, c, partie)] = (time.time(), json.dumps([partants, arrivee]))
         ajouter_performances(partants, jour, r, c)
-        probables = rapports_probables(jour, r, c, pari) if len(arrivee) < 3 else None
+        probables = fut.result() if fut else None
+        if len(arrivee) >= 3:
+            probables = None
         definitifs = {}
         if len(arrivee) >= 3:
             cle = (jour, r, c)
@@ -341,6 +377,7 @@ def bilan(dates, heure, pari):
     """Courses passées pour une liste de dates JJMMAAAA : {"resultats": {date: course ou None}, "sature": bool}.
     Seuls les jours traités figurent dans « resultats » ; les autres seront redemandés."""
     resultats = {}
+    CONTEXTE.fond = True
     for d in dates:
         if DEMO:
             resultats[d] = demo_jour((datetime.now() - datetime.strptime(d, "%d%m%Y")).days)
@@ -572,6 +609,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if u.path == "/":
                 return self.envoyer(200, PAGE, "text/html; charset=utf-8")
+            if u.path == "/ping":
+                return self.envoyer(200, "ok", "text/plain; charset=utf-8")
             if u.path == "/manifest.webmanifest":
                 return self.envoyer(200, MANIFEST, "application/manifest+json")
             if u.path in ("/icon-192.png", "/icon-512.png"):
@@ -1076,7 +1115,9 @@ function majFormule() {
 $("pari").addEventListener("change", e => {
   pari = prefPari = e.target.value;
   try { localStorage.setItem("ml_pari", pari); } catch (_) {}
-  remplirCourses(); majFormule(); rafraichir(); chargerBilan();
+  majFormule();
+  calculer();                        // tout de suite, avec les cotes déjà reçues
+  setTimeout(() => { remplirCourses(); rafraichir(); chargerBilan(); }, 0);   // le reste suit en arrière-plan
 });
 
 // ---------- boucle temps réel
@@ -1090,15 +1131,16 @@ async function rafraichir() {
     const j = await avecSecours(() => viaServeur(`/api/course?r=${co.r}&c=${co.c}&pari=${tp}&partie=${partie}`, "Données indisponibles"),
                                 () => directCourse(co, tp, partie));
     if (demande !== courant.r + "-" + courant.c + "-" + pari) return;   // l'utilisateur a changé entre-temps
-    donnees = j; $("erreur").hidden = true;
+    j.pariProb = tp; donnees = j; $("erreur").hidden = true;
     etat(true, (direct ? "Connexion directe au PMU · " : "Cotes en direct · ") + new Date(j.maj).toLocaleTimeString("fr-FR"));
     calculer();
   } catch (e) {
     $("erreur").hidden = false; $("erreur").textContent = e.message + ". Nouvel essai dans 20 s.";
     etat(false, "Hors ligne");
   }
-  const reste = (courant.heure || 0) - Date.now();
-  timer = setTimeout(rafraichir, reste > 0 && reste < 5 * 60000 ? 10000 : 20000);
+  // cadence : 20 s loin du départ, 10 s dans la dernière demi-heure, 5 s dans les 5 dernières minutes
+  const reste = (courant.heure || 0) - Date.now(), finie = donnees && (donnees.arrivee || []).length >= 3;
+  timer = setTimeout(rafraichir, finie ? 60000 : reste <= 0 ? 15000 : reste < 5 * 60000 ? 5000 : reste < 30 * 60000 ? 10000 : 20000);
 }
 // Sur téléphone, le navigateur met la page en pause en arrière-plan : on relance dès qu'elle revient
 document.addEventListener("visibilitychange", () => { if (!document.hidden) rafraichir(); });
@@ -1125,8 +1167,40 @@ function permutations(a) {
   a.forEach((x, i) => { for (const p of permutations(a.filter((_, j) => j !== i))) out.push([x].concat(p)); });
   return out;
 }
-function setP(pv, S) { let t = 0; for (const q of permutations(S)) t += seqP(pv, q); return t; }   // les |S| premiers, ordre indifférent
+const PERMS = {};                   // ordres possibles de k éléments, calculés une seule fois
+function setP(pv, S) {              // les |S| premiers, ordre indifférent
+  const k = S.length; if (k === 1) return pv[S[0]];
+  const perms = PERMS[k] || (PERMS[k] = permutations([...Array(k).keys()]));
+  let t = 0;
+  for (let a = 0; a < perms.length; a++) {
+    const pm = perms[a]; let x = 1, reste = 1;
+    for (let b = 0; b < k; b++) { if (reste <= 1e-12) { x = 0; break; } const v = pv[S[pm[b]]]; x *= v / reste; reste -= v; }
+    t += x;
+  }
+  return t;
+}
+// Paris « placés » : proba qu'un cheval, ou une paire, finisse dans les m premiers.
+// Un seul parcours calcule toutes les paires à la fois ; le résultat est gardé tant que les probabilités ne changent pas.
+const TABLES = new WeakMap();
+function tableTop(pv, m, paires) {
+  let parM = TABLES.get(pv); if (!parM) TABLES.set(pv, parM = {});
+  const cle = m + (paires ? "p" : "");
+  if (parM[cle]) return parM[cle];
+  if (!paires && parM[m + "p"]) return parM[m + "p"];
+  const n = pv.length, seul = new Float64Array(n), paire = paires ? new Float64Array(n * n) : null, used = new Uint8Array(n), chemin = [];
+  (function rec(depth, prob, reste) {
+    if (depth === m || reste <= 1e-12) return;
+    for (let i = 0; i < n; i++) if (!used[i]) {
+      const q = prob * pv[i] / reste; seul[i] += q;
+      if (paires) for (let c = 0; c < depth; c++) { const j = chemin[c]; paire[i < j ? i * n + j : j * n + i] += q; }
+      used[i] = 1; chemin[depth] = i; rec(depth + 1, q, reste - pv[i]); used[i] = 0; }
+  })(0, 1, 1);
+  return parM[cle] = {seul, paire, n};
+}
 function inTopP(pv, S, m) {         // tous les chevaux de S finissent dans les m premiers
+  m = Math.min(m, pv.length - 1);
+  if (S.length === 1) return tableTop(pv, m).seul[S[0]];
+  if (S.length === 2) { const tb = tableTop(pv, m, true), i = Math.min(S[0], S[1]), j = Math.max(S[0], S[1]); return tb.paire[i * tb.n + j]; }
   const n = pv.length, need = new Set(S), used = new Array(n).fill(false); let tot = 0;
   (function rec(depth, prob, reste, found) {
     if (found === S.length) { tot += prob; return; }
@@ -1136,16 +1210,7 @@ function inTopP(pv, S, m) {         // tous les chevaux de S finissent dans les 
   })(0, 1, 1, 0);
   return tot;
 }
-function topDist(pv, m) {           // pour chaque cheval, proba de finir dans les m premiers
-  const n = pv.length, out = new Array(n).fill(0), used = new Array(n).fill(false);
-  (function rec(depth, prob, reste) {
-    if (depth === m || reste <= 1e-12) return;
-    for (let i = 0; i < n; i++) if (!used[i]) {
-      const q = prob * pv[i] / reste; out[i] += q;
-      used[i] = true; rec(depth + 1, q, reste - pv[i]); used[i] = false; }
-  })(0, 1, 1);
-  return out;
-}
+function topDist(pv, m) { return Array.from(tableTop(pv, m).seul); }   // pour chaque cheval, proba de finir dans les m premiers
 function combinaisons(arr, k) {
   const out = [];
   (function rec(s, cur) { if (cur.length === k) { out.push(new Set(cur)); return; }
@@ -1275,20 +1340,24 @@ function quartets(T) { return combinaisons(T, 4).map(s => [...s]); }
 function couvertureMulti(p, T) { let t = 0; for (const q of quartets(T)) t += setP(p, q); return t; }
 // Multi : le ticket principal, puis les tickets qui couvrent le mieux ce que les précédents laissent de côté
 function ticketsMulti(p, k, T1, N) {
-  const n = p.length, idx = p.map((_, i) => i);
-  const cand = [...new Set(idx.slice().sort((x, y) => p[y] - p[x]).slice(0, Math.min(11, n)).concat(T1))];
-  const Q = combinaisons(cand, 4).map(e => { const q = [...e]; return {q, key: q.slice().sort((a, b) => a - b).join(","), p: setP(p, q)}; });
-  const ensembles = combinaisons(cand, Math.min(k, n)), couvre = (e, q) => q.every(i => e.has(i));
-  const couverts = new Set(), exclus = new Set(), out = [];
-  const ajouter = e => { let g = 0; for (const x of Q) if (!couverts.has(x.key) && couvre(e, x.q)) { g += x.p; couverts.add(x.key); }
-    exclus.add([...e].sort((a, b) => a - b).join(",")); out.push({T: [...e].sort((a, b) => p[b] - p[a]), plus: g}); };
-  ajouter(new Set(T1));
+  const n = p.length, parP = (a, b) => p[b] - p[a];
+  if (N <= 1) return [{T: T1.slice().sort(parP), plus: couvertureMulti(p, T1)}];
+  const cand = [...new Set(p.map((_, i) => i).sort(parP).slice(0, Math.min(11, n)).concat(T1))];
+  const bit = new Map(cand.map((h, i) => [h, 1 << i])), masque = e => { let m = 0; for (const h of e) m |= bit.get(h); return m; };
+  // chaque groupe de 4 et chaque ticket possible devient un nombre : « le ticket contient le groupe » se teste en une opération
+  const Q = combinaisons(cand, 4).map(e => ({m: masque(e), p: setP(p, [...e]), fait: false}));
+  const ensembles = combinaisons(cand, Math.min(k, n)).map(e => ({m: masque(e), e, pris: false}));
+  const out = [];
+  const ajouter = (m, e) => { let g = 0; for (const x of Q) if (!x.fait && (x.m & m) === x.m) { g += x.p; x.fait = true; }
+    out.push({T: [...e].sort(parP), plus: g}); };
+  const m1 = masque(T1); for (const x of ensembles) if (x.m === m1) x.pris = true;
+  ajouter(m1, T1);
   while (out.length < N) {
     let best = null, g = -1;
-    for (const e of ensembles) { if (exclus.has([...e].sort((a, b) => a - b).join(","))) continue;
-      let v = 0; for (const x of Q) if (!couverts.has(x.key) && couvre(e, x.q)) v += x.p;
-      if (v > g) { g = v; best = e; } }
-    if (!best) break; ajouter(best);
+    for (const x of ensembles) { if (x.pris) continue;
+      let v = 0; for (const q of Q) if (!q.fait && (q.m & x.m) === q.m) v += q.p;
+      if (v > g) { g = v; best = x; } }
+    if (!best) break; best.pris = true; ajouter(best.m, best.e);
   }
   return out;
 }
@@ -1302,7 +1371,7 @@ function auMoinsUn(pv, tickets, m) {    // paris « placés » : proba qu'au moi
 }
 // Liste de N tickets : le premier suit le style choisi, les suivants sont les combinaisons les plus probables restantes.
 // Renvoie [{T: indices, plus: chance ajoutée par ce ticket}] et la chance totale d'avoir au moins un ticket gagnant.
-function construireTickets(t, k, mod, sty, N) {
+function construireTickets(t, k, mod, sty, N, sansTotal) {
   const p = mod.p, T1 = choisirTicket(mod, k, sty), kind = PARIS[t].kind;
   if (kind === "multi") { const L = ticketsMulti(p, k, T1, N); return {liste: L, total: L.reduce((s, x) => s + x.plus, 0)}; }
   const liste = [{T: T1, plus: probasTicket(t, p, T1).win}];
@@ -1319,7 +1388,7 @@ function construireTickets(t, k, mod, sty, N) {
     liste.push(...cands.slice(0, N - 1));
   }
   // les tickets « ordre exact » ou « les k premiers » ne peuvent pas gagner en même temps : les chances s'additionnent
-  const total = kind === "in" && liste.length > 1 ? auMoinsUn(p, liste.map(x => x.T), placesPlace(t, p.length)) : liste.reduce((s, x) => s + x.plus, 0);
+  const total = sansTotal ? 0 : kind === "in" && liste.length > 1 ? auMoinsUn(p, liste.map(x => x.T), placesPlace(t, p.length)) : liste.reduce((s, x) => s + x.plus, 0);
   return {liste, total};
 }
 
@@ -1330,26 +1399,35 @@ const Kcal = {};                    // pari -> {a: K principal, o: K « ordre »
 function mediane(a) { if (a.length < 5) return null; a.sort((x, y) => x - y); return a[Math.floor(a.length / 2)]; }
 const estDesordre = l => /d[ée]sordre/i.test(l);
 const estOrdre = (t, l) => !estDesordre(l) && (/ordre/i.test(l) || ORDONNES.has(t));
-function calerK(t) {
-  const A = [], O = [], kind = PARIS[t].kind;
-  for (const j of coursesChargees(t)) {
-    const P = j.partants.filter(c => c.partant), mk = marchePMU(P, {});
-    for (const rap of j.rapports[t] || []) {
-      const lib = rap.l.toLowerCase(); if (lib.includes("bonus")) continue;
-      const idx = rap.c.map(nm => P.findIndex(c => c.num === nm)); if (idx.some(x => x < 0)) continue;
-      if (kind === "multi") { if (/en 4$/.test(lib)) A.push(rap.d * setP(mk, idx)); }
-      else if (kind === "od") { if (estDesordre(lib)) A.push(rap.d * setP(mk, idx)); else if (estOrdre(t, lib)) O.push(rap.d * seqP(mk, idx)); }
-      else if (kind === "seq") A.push(rap.d * seqP(mk, idx));
-      else if (kind === "set") A.push(rap.d * setP(mk, idx));
-      else A.push(rap.d * inTopP(mk, idx, placesPlace(t, P.length)));
+function calerK(t) {                // chaque jour n'est calculé qu'une fois
+  const A = [], O = [], kind = PARIS[t].kind, c = bilanCache[t]; if (!c || !c.jours) return;
+  const memo = c.kjours || (c.kjours = new Map());
+  for (const [date, j] of c.jours) {
+    if (!j) continue;
+    let r = memo.get(date);
+    if (!r) {
+      r = {A: [], O: []};
+      const P = j.partants.filter(x => x.partant), mk = marchePMU(P, {});
+      for (const rap of j.rapports[t] || []) {
+        const lib = rap.l.toLowerCase(); if (lib.includes("bonus")) continue;
+        const idx = rap.c.map(nm => P.findIndex(x => x.num === nm)); if (idx.some(x => x < 0)) continue;
+        if (kind === "multi") { if (/en 4$/.test(lib)) r.A.push(rap.d * setP(mk, idx)); }
+        else if (kind === "od") { if (estDesordre(lib)) r.A.push(rap.d * setP(mk, idx)); else if (estOrdre(t, lib)) r.O.push(rap.d * seqP(mk, idx)); }
+        else if (kind === "seq") r.A.push(rap.d * seqP(mk, idx));
+        else if (kind === "set") r.A.push(rap.d * setP(mk, idx));
+        else r.A.push(rap.d * inTopP(mk, idx, placesPlace(t, P.length)));
+      }
+      memo.set(date, r);
     }
+    for (const x of r.A) A.push(x); for (const x of r.O) O.push(x);
   }
   Kcal[t] = {a: mediane(A), o: mediane(O)};
 }
 let probMap = {};
 function chargerProbables() {
   probMap = {};
-  for (const [nums, d, mn, mx] of (donnees && donnees.probables) || []) {
+  if (!donnees || donnees.pariProb !== pari) return;       // rapports probables d'un autre pari : on attend les bons
+  for (const [nums, d, mn, mx] of donnees.probables || []) {
     const key = (ORDONNES.has(pari) ? nums : nums.slice().sort((a, b) => a - b)).join("-");
     probMap[key] = {d, mn, mx};
   }
@@ -1564,7 +1642,7 @@ async function chargerBilan() {
   const t = pari;
   $("bTitre").textContent = `Test sur les courses passées — ${PARIS[t].nom}`;
   const c = bilanCache[t] || (bilanCache[t] = {jours: null, enCours: false});
-  const afficher = () => { if (t === pari) { calerK(t); calculerBilan(); calculer(); } };
+  const afficher = () => { if (t === pari) { calerK(t); calculer(); calculerBilan(); } };
   if (c.enCours) return;
   c.enCours = true;
   try {
@@ -1589,28 +1667,54 @@ async function chargerBilan() {
     bilanAvance = "Chargement interrompu (" + e.message + "). Il reprendra à la prochaine ouverture. "; afficher();
   } finally { c.enCours = false; }
 }
-function calculerBilan() {
+// Chaque jour passé n'est rejoué qu'une fois par réglage (pari, formule, nombre de tickets, poids des analyses) :
+// le résultat est gardé pour 1 € de mise, donc changer la mise ou le style ne recalcule rien.
+const bilanMemo = {cle: "", jours: new Map()};
+let bilanTour = 0;
+function rejouerJour(t, k, N, w, j) {
+  const P = j.partants.filter(c => c.partant), raps = j.rapports[t], multi = t === "MULTI";
+  if (P.length < k + 1 || !raps || !raps.length) return null;
+  if (multi && !raps.some(r => new RegExp("en " + k + "$").test(r.l.toLowerCase()))) return null;
+  const dj = j.date, jourJ = +new Date(+dj.slice(4), +dj.slice(2, 4) - 1, +dj.slice(0, 2));
+  const mod = modele(P, w, {}, {distance: j.distance, hippodrome: j.hippodrome, discipline: j.discipline, jour: jourJ});
+  const jouer = (m, sty) => { const L = construireTickets(t, k, m, sty, N, true).liste;
+    return {g: L.reduce((s, x) => s + gainReel(t, k, x.T.map(i => P[i].num), raps), 0), nb: L.length}; };
+  const res = {};
+  for (const c of ["prudent", "equilibre", "outsiders"]) res[c] = jouer(mod, c);
+  res.fav = jouer({p: mod.marche, marche: mod.marche}, "prudent");       // les favoris des parieurs, sans analyse
+  return res;
+}
+async function calculerBilan() {
   const t = pari, cache = bilanCache[t]; if (!cache || !cache.jours) return;
-  const data = datesPassees(periode()).map(d => cache.jours.get(d)).filter(Boolean);
-  const w = poids(), k = tailleTicket(t), mise = maMise(), multi = t === "MULTI", N = nbTickets();
-  const cles = ["prudent", "equilibre", "outsiders", "fav"], st = {};
+  const tour = ++bilanTour;
+  const w = poids(), k = tailleTicket(t), N = nbTickets(), multi = t === "MULTI";
+  const cle = [t, k, N, CURSEURS.map(c => $(c).value).join("-")].join("|");
+  if (bilanMemo.cle !== cle) { bilanMemo.cle = cle; bilanMemo.jours = new Map(); }
+  const dates = datesPassees(periode());
+  const aFaire = dates.filter(d => cache.jours.get(d) && !bilanMemo.jours.has(d));
+  // calcul par tranches courtes, en rendant la main à l'écran entre deux
+  let debut = performance.now(), faits = 0;
+  for (const d of aFaire) {
+    bilanMemo.jours.set(d, rejouerJour(t, k, N, w, cache.jours.get(d)));
+    if (++faits % 3 === 0 && performance.now() - debut > 25) {
+      if (faits % 30 === 0 || faits === 3) $("bEtat").textContent = bilanAvance + `Calcul du test : ${faits} courses sur ${aFaire.length}…`;
+      await new Promise(r => setTimeout(r, 0));
+      if (tour !== bilanTour || bilanMemo.cle !== cle) return;        // un réglage a changé entre-temps : ce calcul est abandonné
+      debut = performance.now();
+    }
+  }
+  if (tour !== bilanTour) return;
+  afficherBilan(t, k, N, multi, dates, cache);
+}
+function afficherBilan(t, k, N, multi, dates, cache) {
+  const mise = maMise(), cles = ["prudent", "equilibre", "outsiders", "fav"], st = {};
   for (const c of cles) st[c] = {n: 0, g: 0, mise: 0, ret: 0};
-  const lignes = [];
-  for (const j of data) {
-    const P = j.partants.filter(c => c.partant), raps = j.rapports[t];
-    if (P.length < k + 1 || !raps || !raps.length) continue;
-    if (multi && !raps.some(r => new RegExp("en " + k + "$").test(r.l.toLowerCase()))) continue;
-    const dj = j.date, jourJ = +new Date(+dj.slice(4), +dj.slice(2, 4) - 1, +dj.slice(0, 2));
-    const mod = modele(P, w, {}, {distance: j.distance, hippodrome: j.hippodrome, discipline: j.discipline, jour: jourJ}), nums = idx => idx.map(i => P[i].num), gains = {};
-    const jouer = (m, sty) => { const L = construireTickets(t, k, m, sty, N).liste;
-      return {g: L.reduce((s, x) => s + gainReel(t, k, nums(x.T), raps), 0) * mise, nb: L.length}; };
-    const res = {};
-    for (const c of ["prudent", "equilibre", "outsiders"]) res[c] = jouer(mod, c);
-    res.fav = jouer({p: mod.marche, marche: mod.marche}, "prudent");       // les favoris des parieurs, sans analyse
-    for (const c of cles) { gains[c] = res[c].g; st[c].n++; st[c].mise += mise * res[c].nb; if (gains[c]) { st[c].g++; st[c].ret += gains[c]; } }
-    const d = j.date, cell = g => `<td class="${g ? "tr-down" : ""}">${g ? "✓ +" + euro(g) : "✗"}</td>`;
+  const lignes = [], cell = g => `<td class="${g ? "tr-down" : ""}">${g ? "✓ +" + euro(g) : "✗"}</td>`;
+  for (const d of dates) {
+    const res = bilanMemo.jours.get(d), j = cache.jours.get(d); if (!res || !j) continue;
+    for (const c of cles) { const g = res[c].g * mise; st[c].n++; st[c].mise += mise * res[c].nb; if (g) { st[c].g++; st[c].ret += g; } }
     lignes.push(`<tr><td class="l">${d.slice(0, 2)}/${d.slice(2, 4)}</td><td class="l">${esc(j.hippodrome)} R${j.r}C${j.c}</td>
-      <td class="l">${j.arrivee.join("-")}</td>${cles.map(c => cell(gains[c])).join("")}</tr>`);
+      <td class="l">${j.arrivee.join("-")}</td>${cles.map(c => cell(res[c].g * mise)).join("")}</tr>`);
   }
   const carte = (titre, s, sous, actif) => `<div class="bcard${actif ? " actif" : ""}"><h3>${titre}</h3><div class="sub">${sous}</div>
       <div class="bnet ${s.ret - s.mise >= 0 ? "tr-down" : "tr-up"}">${signe(s.ret - s.mise)}</div>
@@ -1618,11 +1722,14 @@ function calculerBilan() {
   $("bCartes").innerHTML = st.fav.n ? ["prudent", "equilibre", "outsiders"].map(c =>
       carte("Style " + STYLES[c].nom, st[c], c === style ? "ton style actuel" : (N > 1 ? "tickets de l'appli" : "ticket de l'appli"), c === style)).join("") +
     carte(k > 1 ? `Les ${k} favoris` : "Le favori", st.fav, k > 1 ? "les plus petites cotes, sans analyse" : "la plus petite cote, sans analyse") : "";
-  $("bCorps").innerHTML = lignes.join("");
+  // le détail jour par jour n'est rempli que s'il est ouvert (plusieurs centaines de lignes sur 6 mois)
+  const det = $("bCorps").closest("details");
+  det._lignes = lignes; if (det.open) $("bCorps").innerHTML = lignes.join(""); else $("bCorps").innerHTML = "";
   $("bEtat").textContent = bilanAvance + (st.fav.n
     ? `${st.fav.n} courses analysées, ${PARIS[t].nom}${multi ? " en " + k : ""} ${N > 1 ? ", " + N + " tickets" : ""} à ${euro(mise)} ${N > 1 ? "chacun" : "par jour"} : chaque jour, la course proposant ce pari la plus proche de ${HEURE_CIBLE.replace(":", "h")}. Gains calculés avec les vrais rapports du PMU. Calcul fait avec les cotes finales : en vrai, quelques minutes avant le départ, c'est un peu moins bon.`
     : (bilanAvance ? "" : "Aucune course exploitable pour ce pari sur la période."));
 }
+$("bCorps").closest("details").addEventListener("toggle", e => { if (e.target.open && e.target._lignes) $("bCorps").innerHTML = e.target._lignes.join(""); });
 
 function spark(h) {
   if (!h || h.length < 2) return '<svg class="spark" width="60" height="18"></svg>';
@@ -1633,9 +1740,12 @@ function spark(h) {
 }
 
 // ---------- réglages
-function recalcul() { calculer(); clearTimeout(bilanTimer); bilanTimer = setTimeout(calculerBilan, 400); }
+function recalcul() { calculer(); clearTimeout(bilanTimer); bilanTimer = setTimeout(calculerBilan, 250); }
+let curseurTimer = null;
 for (const k of CURSEURS) $(k).addEventListener("input", e => {
-  try { localStorage.setItem("ml_" + k, e.target.value); } catch (_) {} recalcul(); });
+  try { localStorage.setItem("ml_" + k, e.target.value); } catch (_) {}
+  $("v" + k.slice(1)).textContent = e.target.value;                    // le chiffre suit le doigt, le calcul attend la fin du geste
+  clearTimeout(curseurTimer); curseurTimer = setTimeout(recalcul, 120); });
 $("nbt").addEventListener("change", e => {
   try { localStorage.setItem("ml_nbt", e.target.value); } catch (_) {} recalcul(); });
 $("periode").addEventListener("change", e => {
