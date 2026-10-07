@@ -789,6 +789,12 @@ header{align-items:center}
 .ticket .nums.ord .n{height:56px;align-content:center;line-height:1.1}
 .ticket .n i{display:block;font-style:normal;font-size:10px;font-weight:600;opacity:.85}
 .reglages{margin-top:16px}
+.optim{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:8px;display:grid;gap:6px}
+.optim b.t{font-size:15px}
+.optim ul{margin:0;padding-left:18px}
+.optim .copie{justify-self:start;margin-top:4px}
+.bilan details{margin-top:12px}
+tr.grp td{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding-top:12px}
 .tk{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
 .tk:last-child{border-bottom:0}
 .tk .lab{flex:0 0 100%;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
@@ -856,10 +862,20 @@ table.btab{min-width:620px}
 
 <section class="panel bilan">
   <h2 id="bTitre">Test sur les courses passées</h2>
-  <div class="champ" style="max-width:220px;margin-bottom:8px"><label for="periode">Période testée</label>
-    <select id="periode"><option value="30">30 derniers jours</option><option value="90">3 derniers mois</option><option value="180">6 derniers mois</option></select></div>
+  <div class="choix" style="margin:0 0 8px">
+    <div class="champ"><label for="periode">Période testée</label>
+      <select id="periode"><option value="30">30 derniers jours</option><option value="90">3 derniers mois</option><option value="180">6 derniers mois</option></select></div>
+    <div class="champ"><label for="joues">Jours joués</label>
+      <select id="joues"><option value="tous">Tous les jours</option><option value="jouable">Sauf verdict défavorable</option><option value="favorable">Seulement verdict favorable</option></select></div>
+  </div>
   <p class="sub" id="bEtat">Chargement…</p>
   <div class="bcartes" id="bCartes"></div>
+  <button class="copie" id="optim" type="button">Chercher le meilleur réglage</button>
+  <div id="optimRes" class="optim" hidden></div>
+  <details><summary>Résultats par type de course</summary>
+    <p class="sub">Part de la mise récupérée avec ton style actuel, comparée aux favoris. Moins il y a de courses dans une ligne, moins le chiffre est fiable.</p>
+    <div class="tablewrap"><table class="btab"><thead><tr><th class="l">Type de course</th><th>Courses</th><th>Appli</th><th>Favoris</th></tr></thead><tbody id="bTypes"></tbody></table></div>
+  </details>
   <details><summary>Détail jour par jour</summary>
     <div class="tablewrap"><table class="btab"><thead><tr><th class="l">Jour</th><th class="l">Course</th><th class="l">Arrivée</th><th>Prudent</th><th>Équilibré</th><th>Outsiders</th><th>Favoris</th></tr></thead><tbody id="bCorps"></tbody></table></div>
   </details>
@@ -1300,7 +1316,9 @@ function atouts(P, ctx) {            // ctx = {distance, hippodrome, discipline,
     return o;
   });
 }
-function modele(P, w, srcs, ctx) {       // probabilité de gagner de chaque cheval, en croisant les 6 analyses
+// Les 6 analyses d'une course, chacune ramenée à une répartition de chances entre les chevaux.
+// Elles ne dépendent pas du dosage : on les calcule une fois, puis on les mélange selon les poids.
+function composantes(P, srcs, ctx) {
   const marche = marchePMU(P, srcs);
   const mouv = normaliser(P.map((c, i) => {
     const f = c.coteMatin && c.coteDirect ? Math.min(2, Math.max(.5, c.coteMatin / c.coteDirect)) : 1;
@@ -1315,11 +1333,18 @@ function modele(P, w, srcs, ctx) {       // probabilité de gagner de chaque che
   const aucuneApt = moyA === null;                // pas de courses passées connues : l'analyse est mise de côté
   const apt = normaliser(at.map(o => Math.pow(o.apt === null ? (moyA || .3) : o.apt, 2)));
   const sig = normaliser(at.map(o => o.signal * o.signal));
-  const wA = aucuneApt ? 0 : (w.A || 0), wS = w.S || 0;
-  const W = (w.M + w.T + w.F + w.R + wA + wS) || 1;
-  const p = normaliser(P.map((_, i) => (w.M * marche[i] + w.T * mouv[i] + w.F * forme[i] + w.R * regul[i] + wA * apt[i] + wS * sig[i]) / W));
-  return {p, marche, fr, at};
+  return {marche, mouv, forme, regul, apt, sig, aucuneApt, fr, at};
 }
+function doser(c, w) {                // probabilité de gagner de chaque cheval pour un dosage donné
+  const wA = c.aucuneApt ? 0 : (w.A || 0), wS = w.S || 0;
+  let W = w.M + w.T + w.F + w.R + wA + wS, M = w.M;
+  if (!W) { W = 1; M = 1; }           // tous les poids à zéro : on suit les cotes
+  const n = c.marche.length, p = new Array(n); let s = 0;
+  for (let i = 0; i < n; i++) { p[i] = (M * c.marche[i] + w.T * c.mouv[i] + w.F * c.forme[i] + w.R * c.regul[i] + wA * c.apt[i] + wS * c.sig[i]) / W; s += p[i]; }
+  for (let i = 0; i < n; i++) p[i] /= s || 1;
+  return {p, marche: c.marche, fr: c.fr, at: c.at};
+}
+function modele(P, w, srcs, ctx) { return doser(composantes(P, srcs, ctx), w); }
 // Choix du ticket selon le style. Un « outsider » est un cheval hors des favoris des parieurs ;
 // on prend ceux que l'appli note le mieux par rapport à leur cote (proba × avantage sur le marché).
 function choisirTicket(mod, k, sty) {
@@ -1641,6 +1666,7 @@ function coursesChargees(t) { const c = bilanCache[t]; return c ? [...c.jours.va
 async function chargerBilan() {
   const t = pari;
   $("bTitre").textContent = `Test sur les courses passées — ${PARIS[t].nom}`;
+  $("optimRes").hidden = true;       // un résultat de recherche ne vaut que pour le pari et la période où il a été calculé
   const c = bilanCache[t] || (bilanCache[t] = {jours: null, enCours: false});
   const afficher = () => { if (t === pari) { calerK(t); calculer(); calculerBilan(); } };
   if (c.enCours) return;
@@ -1671,17 +1697,38 @@ async function chargerBilan() {
 // le résultat est gardé pour 1 € de mise, donc changer la mise ou le style ne recalcule rien.
 const bilanMemo = {cle: "", jours: new Map()};
 let bilanTour = 0;
-function rejouerJour(t, k, N, w, j) {
+const ctxJour = j => ({distance: j.distance, hippodrome: j.hippodrome, discipline: j.discipline,
+                       jour: +new Date(+j.date.slice(4), +j.date.slice(2, 4) - 1, +j.date.slice(0, 2))});
+// Verdict d'un ticket passé, rangé de façon à pouvoir appliquer plus tard le calage K :
+// part de la mise rendue = c + K.a × a + K.o × o
+function coefVerdict(t, k, P, mod, T) {
+  const kind = PARIS[t].kind;
+  if (kind === "multi") { let a = 0; for (const q of quartets(T)) a += setP(mod.p, q) / (NB_GROUPES[k] * Math.max(setP(mod.marche, q), 1e-9)); return {c: 0, a, o: 0}; }
+  const pr = probasTicket(t, mod.p, T), pm = probasTicket(t, mod.marche, T);
+  if (kind === "od") return {c: 0, a: pm.win > 0 ? (pr.win - pr.ordre) / pm.win : 0, o: pm.ordre > 0 ? pr.ordre / pm.ordre : 0};
+  if (t === "SIMPLE_GAGNANT" && P[T[0]].coteDirect) return {c: pr.win * P[T[0]].coteDirect, a: 0, o: 0};
+  return {c: 0, a: pm.win > 0 ? pr.win / pm.win : 0, o: 0};
+}
+function partRendue(t, v) {           // null tant que le calage n'est pas connu
+  const K = Kcal[t] || {};
+  if ((v.a && !K.a) || (v.o && !K.o)) return null;
+  return v.c + (K.a || 0) * v.a + (K.o || 0) * v.o;
+}
+function rejouerJour(t, k, N, w, j, comp) {
   const P = j.partants.filter(c => c.partant), raps = j.rapports[t], multi = t === "MULTI";
   if (P.length < k + 1 || !raps || !raps.length) return null;
   if (multi && !raps.some(r => new RegExp("en " + k + "$").test(r.l.toLowerCase()))) return null;
-  const dj = j.date, jourJ = +new Date(+dj.slice(4), +dj.slice(2, 4) - 1, +dj.slice(0, 2));
-  const mod = modele(P, w, {}, {distance: j.distance, hippodrome: j.hippodrome, discipline: j.discipline, jour: jourJ});
-  const jouer = (m, sty) => { const L = construireTickets(t, k, m, sty, N, true).liste;
-    return {g: L.reduce((s, x) => s + gainReel(t, k, x.T.map(i => P[i].num), raps), 0), nb: L.length}; };
+  const mod = doser(comp || composantes(P, {}, ctxJour(j)), w);
+  const jouer = (m, sty) => { const L = construireTickets(t, k, m, sty, N, true).liste, v = {c: 0, a: 0, o: 0};
+    for (const x of L) { const e = coefVerdict(t, k, P, m, x.T); v.c += e.c / L.length; v.a += e.a / L.length; v.o += e.o / L.length; }
+    return {g: L.reduce((s, x) => s + gainReel(t, k, x.T.map(i => P[i].num), raps), 0), nb: L.length, v}; };
   const res = {};
   for (const c of ["prudent", "equilibre", "outsiders"]) res[c] = jouer(mod, c);
   res.fav = jouer({p: mod.marche, marche: mod.marche}, "prudent");       // les favoris des parieurs, sans analyse
+  const d = (j.discipline || "").toUpperCase();
+  res.type = {disc: /ATTELE/.test(d) ? "Trot attelé" : /MONTE/.test(d) ? "Trot monté" : /PLAT/.test(d) ? "Plat" : /HAIE|STEEPLE|CROSS/.test(d) ? "Obstacles" : "Autre",
+              nb: P.length <= 12 ? "12 partants ou moins" : P.length <= 15 ? "13 à 15 partants" : "16 partants ou plus",
+              fav: (m => m >= .3 ? "Favori net (30 % ou plus)" : m >= .2 ? "Favori moyen (20 à 30 %)" : "Course ouverte (moins de 20 %)")(Math.max(...mod.marche))};
   return res;
 }
 async function calculerBilan() {
@@ -1707,12 +1754,22 @@ async function calculerBilan() {
   afficherBilan(t, k, N, multi, dates, cache);
 }
 function afficherBilan(t, k, N, multi, dates, cache) {
-  const mise = maMise(), cles = ["prudent", "equilibre", "outsiders", "fav"], st = {};
-  for (const c of cles) st[c] = {n: 0, g: 0, mise: 0, ret: 0};
-  const lignes = [], cell = g => `<td class="${g ? "tr-down" : ""}">${g ? "✓ +" + euro(g) : "✗"}</td>`;
+  const mise = maMise(), cles = ["prudent", "equilibre", "outsiders", "fav"], st = {}, filtre = $("joues").value;
+  const vide = () => ({n: 0, g: 0, mise: 0, ret: 0});
+  for (const c of cles) st[c] = vide();
+  const types = {}, lignes = [], cell = g => `<td class="${g ? "tr-down" : ""}">${g ? "✓ +" + euro(g) : "✗"}</td>`;
+  let ecartes = 0, sansVerdict = 0;
   for (const d of dates) {
     const res = bilanMemo.jours.get(d), j = cache.jours.get(d); if (!res || !j) continue;
+    // le filtre suit le verdict de ton style actuel ; les quatre cartes portent sur les mêmes jours, pour comparer à égalité
+    const part = partRendue(t, res[style].v);
+    if (filtre !== "tous") { if (part === null) { sansVerdict++; continue; } if (part < (filtre === "favorable" ? 1 : 0.85)) { ecartes++; continue; } }
     for (const c of cles) { const g = res[c].g * mise; st[c].n++; st[c].mise += mise * res[c].nb; if (g) { st[c].g++; st[c].ret += g; } }
+    const verd = part === null ? "Verdict inconnu" : part >= 1 ? "Verdict favorable" : part >= .85 ? "Verdict limite" : "Verdict défavorable";
+    for (const [grp, nom] of [["Discipline", res.type.disc], ["Nombre de partants", res.type.nb], ["Force du favori", res.type.fav], ["Verdict de l'appli", verd]]) {
+      const x = (types[grp] = types[grp] || {})[nom] = (types[grp][nom] || {a: vide(), f: vide()});
+      for (const [o, c] of [[x.a, style], [x.f, "fav"]]) { o.n++; o.mise += res[c].nb; o.ret += res[c].g; }
+    }
     lignes.push(`<tr><td class="l">${d.slice(0, 2)}/${d.slice(2, 4)}</td><td class="l">${esc(j.hippodrome)} R${j.r}C${j.c}</td>
       <td class="l">${j.arrivee.join("-")}</td>${cles.map(c => cell(res[c].g * mise)).join("")}</tr>`);
   }
@@ -1722,14 +1779,89 @@ function afficherBilan(t, k, N, multi, dates, cache) {
   $("bCartes").innerHTML = st.fav.n ? ["prudent", "equilibre", "outsiders"].map(c =>
       carte("Style " + STYLES[c].nom, st[c], c === style ? "ton style actuel" : (N > 1 ? "tickets de l'appli" : "ticket de l'appli"), c === style)).join("") +
     carte(k > 1 ? `Les ${k} favoris` : "Le favori", st.fav, k > 1 ? "les plus petites cotes, sans analyse" : "la plus petite cote, sans analyse") : "";
+  // tableau par type de course
+  const pc = o => o.mise ? Math.round(100 * o.ret / o.mise) + " %" : "–";
+  $("bTypes").innerHTML = Object.entries(types).map(([grp, noms]) => `<tr class="grp"><td class="l" colspan="4">${grp}</td></tr>` +
+    Object.entries(noms).sort((a, b) => b[1].a.n - a[1].a.n).map(([nom, x]) => { const mieux = x.a.mise && x.a.ret / x.a.mise > x.f.ret / x.f.mise;
+      return `<tr><td class="l">${nom}</td><td>${x.a.n}</td><td class="${mieux ? "tr-down" : ""}"><b>${pc(x.a)}</b></td><td>${pc(x.f)}</td></tr>`; }).join("")).join("");
   // le détail jour par jour n'est rempli que s'il est ouvert (plusieurs centaines de lignes sur 6 mois)
   const det = $("bCorps").closest("details");
   det._lignes = lignes; if (det.open) $("bCorps").innerHTML = lignes.join(""); else $("bCorps").innerHTML = "";
+  const tri = filtre === "tous" ? "" : ` Jours écartés par le filtre : ${ecartes}${sansVerdict ? `, plus ${sansVerdict} sans verdict` : ""}.`;
   $("bEtat").textContent = bilanAvance + (st.fav.n
-    ? `${st.fav.n} courses analysées, ${PARIS[t].nom}${multi ? " en " + k : ""} ${N > 1 ? ", " + N + " tickets" : ""} à ${euro(mise)} ${N > 1 ? "chacun" : "par jour"} : chaque jour, la course proposant ce pari la plus proche de ${HEURE_CIBLE.replace(":", "h")}. Gains calculés avec les vrais rapports du PMU. Calcul fait avec les cotes finales : en vrai, quelques minutes avant le départ, c'est un peu moins bon.`
-    : (bilanAvance ? "" : "Aucune course exploitable pour ce pari sur la période."));
+    ? `${st.fav.n} courses jouées, ${PARIS[t].nom}${multi ? " en " + k : ""} ${N > 1 ? ", " + N + " tickets" : ""} à ${euro(mise)} ${N > 1 ? "chacun" : "par jour"} : chaque jour, la course proposant ce pari la plus proche de ${HEURE_CIBLE.replace(":", "h")}.${tri} Gains calculés avec les vrais rapports du PMU et les cotes finales : en vrai, quelques minutes avant le départ, c'est un peu moins bon.`
+    : (bilanAvance ? "" : filtre === "tous" ? "Aucune course exploitable pour ce pari sur la période." : `Aucun jour ne passe ce filtre sur la période.${tri}`));
 }
 $("bCorps").closest("details").addEventListener("toggle", e => { if (e.target.open && e.target._lignes) $("bCorps").innerHTML = e.target._lignes.join(""); });
+
+// ---------- recherche automatique du meilleur dosage
+// On règle les poids sur les courses les plus anciennes, puis on vérifie sur les plus récentes, jamais vues pendant le réglage.
+// Le réglage cherche le dosage qui prévoit le mieux les 3 premiers (vraisemblance), pas celui qui a rapporté le plus :
+// viser le gain sur si peu de courses reviendrait à régler l'appli sur quelques gros rapports dus au hasard.
+const NOMS_POIDS = {M: "Cotes", T: "Mouvement", F: "Forme", R: "Régularité", A: "Aptitudes", S: "Signaux"};
+const COTES_SEULES = {M: 100, T: 0, F: 0, R: 0, A: 0, S: 0};
+let reglageTrouve = null;
+function prevision(jeu, w) {          // moyenne du log de la proba donnée à l'arrivée réelle (3 premiers) : plus c'est haut, mieux c'est
+  let s = 0;
+  for (const x of jeu) s += Math.log(Math.max(seqP(doser(x.comp, w).p, x.arr), 1e-12));
+  return s / jeu.length;
+}
+async function chercherReglage() {
+  const t = pari, cache = bilanCache[t], box = $("optimRes"); box.hidden = false;
+  const k = tailleTicket(t), N = nbTickets();
+  const jeu = [];
+  for (const d of datesPassees(periode()).reverse()) {          // du plus ancien au plus récent
+    const j = cache && cache.jours && cache.jours.get(d); if (!j) continue;
+    const P = j.partants.filter(c => c.partant), arr = j.arrivee.slice(0, 3).map(nm => P.findIndex(c => c.num === nm));
+    if (P.length < Math.max(k + 1, 5) || arr.length < 3 || arr.some(i => i < 0)) continue;
+    jeu.push({j, arr, comp: composantes(P, {}, ctxJour(j))});
+  }
+  if (jeu.length < 40) { box.innerHTML = `<b class="t">Pas assez de courses</b><span class="sub">Il en faut au moins 40 pour régler puis vérifier (${jeu.length} chargées). Choisis « 3 derniers mois » ou « 6 derniers mois » et attends la fin du chargement.</span>`; return; }
+  box.innerHTML = '<span class="sub">Recherche en cours…</span>';
+  await new Promise(r => setTimeout(r, 30));
+  const coupe = Math.round(jeu.length * 0.6), regl = jeu.slice(0, coupe), verif = jeu.slice(coupe);
+  // descente coordonnée par coordonnée, depuis deux points de départ
+  let meilleur = null;
+  for (const depart of [poids(), COTES_SEULES]) {
+    const w = Object.assign({}, depart); let score = prevision(regl, w);
+    for (let passe = 0; passe < 3; passe++) for (const c of Object.keys(NOMS_POIDS)) {
+      let bv = w[c];
+      for (let v = 0; v <= 100; v += 5) { const essai = Object.assign({}, w, {[c]: v}); if (!(essai.M + essai.T + essai.F + essai.R + essai.A + essai.S)) continue;
+        const sc = prevision(regl, essai); if (sc > score + 1e-9) { score = sc; bv = v; } }
+      w[c] = bv;
+    }
+    if (!meilleur || score > meilleur.score) meilleur = {w, score};
+    await new Promise(r => setTimeout(r, 0));
+  }
+  // vérification sur les courses récentes : qualité de prévision, puis mise récupérée avec ton pari actuel
+  const rendu = w => { let mise = 0, ret = 0, fm = 0, fr = 0;
+    for (const x of verif) { const r = rejouerJour(t, k, N, w, x.j, x.comp); if (!r) continue; mise += r[style].nb; ret += r[style].g; fm += r.fav.nb; fr += r.fav.g; }
+    return {app: mise ? ret / mise : null, fav: fm ? fr / fm : null}; };
+  const actuel = poids();
+  const pv = {trouve: prevision(verif, meilleur.w), cotes: prevision(verif, COTES_SEULES), actuel: prevision(verif, actuel)};
+  await new Promise(r => setTimeout(r, 0));
+  const rd = {trouve: rendu(meilleur.w), cotes: rendu(COTES_SEULES), actuel: rendu(actuel)};
+  const mieux = pv.trouve > pv.cotes + 0.01;        // gain net de prévision par rapport aux cotes seules
+  reglageTrouve = mieux ? meilleur.w : COTES_SEULES;
+  const txtW = w => Object.keys(NOMS_POIDS).filter(c => w[c] > 0).map(c => `${NOMS_POIDS[c]} ${w[c]}`).join(" · ");
+  const p100 = x => x === null ? "–" : Math.round(100 * x) + " %";
+  box.innerHTML = `<b class="t">${mieux ? "Un réglage prévoit mieux que les cotes seules" : "Aucun réglage ne prévoit mieux que les cotes seules"}</b>
+    <span class="sub">Réglé sur les ${regl.length} courses les plus anciennes, vérifié sur les ${verif.length} plus récentes, que le réglage n'a jamais vues.</span>
+    <span>Meilleur dosage trouvé : <b>${txtW(meilleur.w)}</b></span>
+    <span class="sub">Mise récupérée sur les ${verif.length} courses de vérification (${PARIS[t].nom}, style ${STYLES[style].nom}) :</span>
+    <ul><li>dosage trouvé : <b>${p100(rd.trouve.app)}</b></li><li>ton réglage actuel : <b>${p100(rd.actuel.app)}</b></li>
+      <li>cotes seules : <b>${p100(rd.cotes.app)}</b></li><li>favoris sans analyse : <b>${p100(rd.trouve.fav)}</b></li></ul>
+    <span class="sub">${mieux ? "Ce dosage a mieux prévu les arrivées que les cotes sur des courses qu'il ne connaissait pas. C'est encourageant, mais " + verif.length + " courses restent peu : refais la recherche dans quelques semaines."
+      : "Sur les courses de vérification, les analyses ajoutées aux cotes n'ont pas amélioré la prévision. Le plus sûr est de suivre les cotes seules."} La mise récupérée ci-dessus dépend de quelques gros rapports : c'est la qualité de prévision qui décide.</span>
+    <button class="copie" id="optimOk" type="button">Appliquer ${mieux ? "ce dosage" : "« cotes seules »"}</button>`;
+  $("optimOk").onclick = () => {
+    for (const c of Object.keys(NOMS_POIDS)) { $("w" + c).value = reglageTrouve[c]; $("v" + c).textContent = reglageTrouve[c]; try { localStorage.setItem("ml_w" + c, reglageTrouve[c]); } catch (_) {} }
+    $("optimOk").textContent = "Réglage appliqué"; recalcul();
+  };
+}
+$("optim").addEventListener("click", () => { chercherReglage().catch(e => { $("optimRes").hidden = false; $("optimRes").textContent = "Recherche impossible : " + e.message; }); });
+$("joues").addEventListener("change", e => { try { localStorage.setItem("ml_joues", e.target.value); } catch (_) {} calculerBilan(); });
+try { const jo = localStorage.getItem("ml_joues"); if (jo) $("joues").value = jo; } catch (e) {}
 
 function spark(h) {
   if (!h || h.length < 2) return '<svg class="spark" width="60" height="18"></svg>';
