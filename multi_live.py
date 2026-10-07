@@ -919,6 +919,8 @@ table.btab{min-width:620px}
   <details><summary>Détail jour par jour</summary>
     <div class="tablewrap"><table class="btab"><thead><tr><th class="l">Jour</th><th class="l">Course</th><th class="l">Arrivée</th><th>Prudent</th><th>Équilibré</th><th>Outsiders</th><th>Favoris</th></tr></thead><tbody id="bCorps"></tbody></table></div>
   </details>
+  <button class="copie" id="exporter" type="button">Exporter les courses du test</button>
+  <p class="sub" id="exportEtat" hidden></p>
 </section>
 
 <div class="tablewrap">
@@ -1962,6 +1964,22 @@ async function chercherReglage() {
   };
 }
 $("optim").addEventListener("click", () => { chercherReglage().catch(e => { $("optimRes").hidden = false; $("optimRes").textContent = "Recherche impossible : " + e.message; }); });
+// ---------- export : toutes les courses passées gardées sur le téléphone pour ce pari, dans un seul fichier compressé
+async function exporterCourses() {
+  const t = pari, cache = bilanCache[t], et = $("exportEtat"); et.hidden = false;
+  const vues = new Set(), liste = [];
+  for (const j of (cache && cache.jours ? cache.jours.values() : [])) { if (!j) continue;
+    const cle = j.date + "-" + j.r + "-" + j.c; if (vues.has(cle)) continue; vues.add(cle); liste.push(j); }
+  if (!liste.length) { et.textContent = "Aucune course chargée pour ce pari : attends la fin du chargement."; return; }
+  et.textContent = "Préparation du fichier…";
+  const texte = JSON.stringify({pari: t, exporte: new Date().toISOString(), courses: liste});
+  let blob = new Blob([texte], {type: "application/json"}), nom = `multi-live-${t.toLowerCase()}-${liste.length}-courses.json`;
+  try { if (window.CompressionStream) { blob = await new Response(blob.stream().pipeThrough(new CompressionStream("gzip"))).blob(); blob = new Blob([blob], {type: "application/gzip"}); nom += ".gz"; } } catch (e) {}
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = nom; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  et.textContent = `Fichier « ${nom} » enregistré dans tes Téléchargements (${liste.length} courses, ${(blob.size / 1e6).toFixed(1).replace(".", ",")} Mo).`;
+}
+$("exporter").addEventListener("click", () => exporterCourses().catch(e => { $("exportEtat").hidden = false; $("exportEtat").textContent = "Export impossible : " + e.message; }));
 $("parjour").addEventListener("change", e => { try { localStorage.setItem("ml_parjour", e.target.value); } catch (_) {} chargerBilan(); });
 $("joues").addEventListener("change", e => { try { localStorage.setItem("ml_joues", e.target.value); } catch (_) {} calculerBilan(); });
 try { const jo = localStorage.getItem("ml_joues"); if (jo) $("joues").value = jo; } catch (e) {}
