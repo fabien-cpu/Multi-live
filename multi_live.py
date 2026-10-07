@@ -1757,6 +1757,7 @@ async function chargerBilan() {
     if (!c.jours) { $("bCartes").innerHTML = ""; $("bCorps").innerHTML = ""; $("bEtat").textContent = "Chargement…"; c.jours = await memoire.lire(t); }
     let arret = ""; const essayes = new Set();
     const garder = new Set(idsPasses(190, HEURES_4).map(x => x.id));
+    await completerTypes(t, c, garder, afficher);      // d'abord : rapide (une demande par jour), et utile tout de suite
     while (t === pari) {
       const voulues = idsPasses(periode(), heuresTest()), manque = voulues.filter(x => !c.jours.has(x.id) && !essayes.has(x.id));
       if (!manque.length) break;
