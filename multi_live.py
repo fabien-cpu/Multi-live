@@ -912,6 +912,10 @@ table.btab{min-width:620px}
   <div class="bcartes" id="bCartes"></div>
   <button class="copie" id="optim" type="button">Chercher le meilleur réglage</button>
   <div id="optimRes" class="optim" hidden></div>
+  <details><summary>Comparer les paris</summary>
+    <p class="sub">Ce que chaque pari aurait rendu sur ces mêmes courses en jouant simplement les favoris, pour 100 € misés. Ceux du haut sont ceux qui perdent le moins. Un chiffre un peu au-dessus de 100 € ne prouve pas un pari gagnant : sur quelques centaines de courses, le hasard fait bouger le résultat de 10 à 15 €.</p>
+    <div class="tablewrap"><table class="btab ttab"><thead><tr><th class="l">Pari joué à chaque course</th><th>Courses</th><th>Gagné</th><th>Rendu</th></tr></thead><tbody id="bParis"></tbody></table></div>
+  </details>
   <details><summary>Résultats par type de course</summary>
     <p class="sub">Part de la mise récupérée avec ton style actuel, comparée aux favoris. Moins il y a de courses dans une ligne, moins le chiffre est fiable.</p>
     <div class="tablewrap"><table class="btab ttab"><thead><tr><th class="l">Type de course</th><th>Courses</th><th>Appli</th><th>Favoris</th></tr></thead><tbody id="bTypes"></tbody></table></div>
@@ -933,23 +937,23 @@ table.btab{min-width:620px}
 </table>
 </div>
 
-<p class="sub" style="margin:8px 0 0">Étiquettes : <b>distance ✓</b>, <b>piste ✓</b>, <b>driver ✓</b> ou <b>jockey ✓</b> = le cheval a déjà bien couru sur cette distance, sur cette piste ou avec lui · <b>chrono ✓</b> = parmi les 3 meilleurs chronos récents (trot) · <b>avis + / −</b> = avis de l'entraîneur · <b>rentrée</b> = plus de 4 mois sans courir.</p>
+<p class="sub" style="margin:8px 0 0">Étiquettes : <b>distance ✓</b>, <b>piste ✓</b>, <b>driver ✓</b> ou <b>jockey ✓</b> = le cheval a déjà bien couru sur cette distance, sur cette piste ou avec lui · <b>chrono ✓</b> = parmi les 3 meilleurs chronos récents (trot) · <b>avis + / −</b> = avis de l'entraîneur · <b>rentrée</b> = 2 mois ou plus sans courir · <b>non classé</b> = pas classé à sa dernière course (disqualifié, arrêté, tombé…). Sur 373 vraies courses, ces deux-là ont fini un peu moins souvent dans les 4 premiers que leur cote ne le laissait prévoir : c'est une indication, pas une règle.</p>
 
 <section class="panel reglages">
   <details>
     <summary>Réglages avancés : poids des analyses, cotes d'autres sites</summary>
     <div class="sliders">
-      <div class="sl"><label for="wM">Cotes du marché</label><input id="wM" type="range" min="0" max="100" value="55"><span id="vM"></span>
+      <div class="sl"><label for="wM">Cotes du marché</label><input id="wM" type="range" min="0" max="100" value="100"><span id="vM"></span>
         <small>Ce que pensent les parieurs : la meilleure base, mais elle intègre la marge du PMU.</small></div>
-      <div class="sl"><label for="wT">Mouvement des cotes</label><input id="wT" type="range" min="0" max="100" value="15"><span id="vT"></span>
+      <div class="sl"><label for="wT">Mouvement des cotes</label><input id="wT" type="range" min="0" max="100" value="0"><span id="vT"></span>
         <small>Cote qui baisse depuis le matin = de l'argent qui rentre sur le cheval.</small></div>
-      <div class="sl"><label for="wF">Forme récente</label><input id="wF" type="range" min="0" max="100" value="20"><span id="vF"></span>
+      <div class="sl"><label for="wF">Forme récente</label><input id="wF" type="range" min="0" max="100" value="0"><span id="vF"></span>
         <small>Les 5 dernières places de la musique, la plus récente compte le plus.</small></div>
-      <div class="sl"><label for="wR">Régularité</label><input id="wR" type="range" min="0" max="100" value="10"><span id="vR"></span>
+      <div class="sl"><label for="wR">Régularité</label><input id="wR" type="range" min="0" max="100" value="0"><span id="vR"></span>
         <small>Part des courses finies placé sur toute la carrière.</small></div>
-      <div class="sl"><label for="wA">Aptitudes</label><input id="wA" type="range" min="0" max="100" value="20"><span id="vA"></span>
+      <div class="sl"><label for="wA">Aptitudes</label><input id="wA" type="range" min="0" max="100" value="0"><span id="vA"></span>
         <small>Résultats du cheval sur cette distance, sur cette piste et avec ce jockey ou driver, plus son chrono au trot.</small></div>
-      <div class="sl"><label for="wS">Signaux du jour</label><input id="wS" type="range" min="0" max="100" value="10"><span id="vS"></span>
+      <div class="sl"><label for="wS">Signaux du jour</label><input id="wS" type="range" min="0" max="100" value="0"><span id="vS"></span>
         <small>Ferrage (déferré), avis de l'entraîneur, fraîcheur depuis la dernière course.</small></div>
     </div>
     <p class="sub" style="margin-top:14px">Cotes d'un autre site : une ligne par cheval, <code>numéro;cote</code>. Donne un nom au site, puis Ajouter.</p>
@@ -1380,7 +1384,8 @@ function atouts(P, ctx) {            // ctx = {distance, hippodrome, discipline,
     else if (/^DEFERRE_ANTERIEURS/.test(def)) t.push(["", "déferré ant.", "déferré des antérieurs"]);
     else if (/^DEFERRE_POSTERIEURS/.test(def)) t.push(["", "déferré post.", "déferré des postérieurs"]);
     if (c.avis === "POSITIF") t.push(["plus", "avis +", "avis entraîneur positif"]); else if (c.avis === "NEGATIF") t.push(["moins", "avis −", "avis entraîneur négatif"]);
-    if (o.jours !== null && o.jours > 120) t.push(["moins", "rentrée", "rentrée après " + o.jours + " jours"]);
+    if (o.jours !== null && o.jours >= 60) t.push(["moins", "rentrée", "rentrée après " + o.jours + " jours"]);
+    if ((c.perfs || []).length && !(c.perfs[0].pl > 0)) t.push(["moins", "non classé", "non classé à sa dernière course"]);
     o.tags = t;
     return o;
   });
@@ -1861,6 +1866,9 @@ function afficherBilan(t, k, N, multi, liste) {
   const mise = maMise(), cles = ["prudent", "equilibre", "outsiders", "fav"], st = {}, filtre = $("joues").value, tc = $("typeC").value;
   const vide = () => ({n: 0, g: 0, mise: 0, ret: 0});
   for (const c of cles) st[c] = vide();
+  const COMP = [["Simple placé, le favori", "SIMPLE_PLACE", 1, 0], ["Simple placé, le 2e favori", "SIMPLE_PLACE", 1, 1], ["Couplé placé, les 2 favoris", "COUPLE_PLACE", 2, 0],
+                ["2sur4, les 2 favoris", "DEUX_SUR_QUATRE", 2, 0], ["Simple gagnant, le favori", "SIMPLE_GAGNANT", 1, 0], ["Trio, les 3 favoris", "TRIO", 3, 0],
+                ["Multi en 6, les 6 favoris", "MULTI", 6, 0], ["Multi en 7, les 7 favoris", "MULTI", 7, 0]].map(x => ({nom: x[0], t: x[1], k: x[2], d: x[3], n: 0, g: 0, ret: 0}));
   const types = {}, lignes = [], cell = g => `<td class="${g ? "tr-down" : ""}">${g ? "✓ +" + euro(g) : "✗"}</td>`;
   let ecartes = 0, sansVerdict = 0;
   for (const {id, d, j} of liste) {
@@ -1869,6 +1877,10 @@ function afficherBilan(t, k, N, multi, liste) {
     const part = partRendue(t, res[style].v);
     if (filtre !== "tous") { if (part === null) { sansVerdict++; continue; } if (part < (filtre === "favorable" ? 1 : 0.85)) { ecartes++; continue; } }
     for (const c of cles) { const g = res[c].g * mise; st[c].n++; st[c].mise += mise * res[c].nb; if (g) { st[c].g++; st[c].ret += g; } }
+    const favs = j.partants.filter(c => c.partant && c.coteDirect).sort((a, b) => a.coteDirect - b.coteDirect).map(c => c.num);
+    for (const x of COMP) { const raps = j.rapports[x.t];
+      if (!raps || !raps.length || favs.length <= x.k + x.d || (x.t === "MULTI" && !raps.some(r => new RegExp("en " + x.k + "$").test(r.l.toLowerCase())))) continue;
+      const g = gainReel(x.t, x.k, favs.slice(x.d, x.d + x.k), raps); x.n++; x.ret += g; if (g) x.g++; }
     const verd = part === null ? "Verdict inconnu" : part >= 1 ? "Verdict favorable" : part >= .85 ? "Verdict limite" : "Verdict défavorable";
     for (const [grp, nom] of [["Discipline", res.type.disc], ["Handicap", j.handicap === true ? "Handicap" : j.handicap === false ? "Sans handicap" : "Non renseigné"], ["Nombre de partants", res.type.nb], ["Force du favori", res.type.fav], ["Verdict de l'appli", verd]]) {
       const x = (types[grp] = types[grp] || {})[nom] = (types[grp][nom] || {a: vide(), f: vide()});
@@ -1888,6 +1900,8 @@ function afficherBilan(t, k, N, multi, liste) {
   $("bTypes").innerHTML = Object.entries(types).map(([grp, noms]) => `<tr class="grp"><td class="l" colspan="4">${grp}</td></tr>` +
     Object.entries(noms).sort((a, b) => b[1].a.n - a[1].a.n).map(([nom, x]) => { const mieux = x.a.mise && x.a.ret / x.a.mise > x.f.ret / x.f.mise;
       return `<tr><td class="l">${nom}</td><td>${x.a.n}</td><td class="${mieux ? "tr-down" : ""}"><b>${pc(x.a)}</b></td><td>${pc(x.f)}</td></tr>`; }).join("")).join("");
+  $("bParis").innerHTML = COMP.filter(x => x.n >= 5).sort((a, b) => b.ret / b.n - a.ret / a.n).map(x =>
+    `<tr><td class="l">${x.nom}</td><td>${x.n}</td><td>${Math.round(100 * x.g / x.n)} %</td><td class="${x.ret >= x.n ? "tr-down" : ""}"><b>${Math.round(100 * x.ret / x.n)} €</b></td></tr>`).join("");
   // le détail jour par jour n'est rempli que s'il est ouvert (plusieurs centaines de lignes sur 6 mois)
   const det = $("bCorps").closest("details");
   det._lignes = lignes; if (det.open) $("bCorps").innerHTML = lignes.join(""); else $("bCorps").innerHTML = "";
