@@ -380,7 +380,7 @@ def bilan(dates, heure, pari):
     CONTEXTE.fond = True
     for d in dates:
         if DEMO:
-            resultats[d] = demo_jour((datetime.now() - datetime.strptime(d, "%d%m%Y")).days)
+            resultats[d] = demo_jour((datetime.now() - datetime.strptime(d, "%d%m%Y")).days, heure)
             continue
         if time.time() < PMU_ETAT["pause"]:
             return {"resultats": resultats, "sature": True}
@@ -523,9 +523,11 @@ def demo_definitifs(partants, arr, rnd):
     }
 
 
-def demo_jour(i):
-    """Jour passé fictif (il y a i jours) : arrivée tirée au sort selon les cotes, rapports ~ 70-75 % du juste prix."""
-    rnd = random.Random(1000 + i)
+def demo_jour(i, heure="13:55"):
+    """Course passée fictive (il y a i jours, vers l'heure demandée) : arrivée tirée au sort selon les cotes,
+    rapports ~ 70-75 % du juste prix."""
+    hh, mm = (int(x) for x in heure.split(":"))
+    rnd = random.Random(1000 + i + 100000 * hh)
     d = datetime.now() - timedelta(days=i)
     partants = []
     for n, nom, mus, matin, drv, crs, vic, pl in DEMO_CHEVAUX[:rnd.randint(13, 16)]:
@@ -543,9 +545,9 @@ def demo_jour(i):
                 arr.append(k)
                 reste.pop(k)
                 break
-    return {"date": d.strftime("%d%m%Y"), "r": 1, "c": 3, "hippodrome": "VINCENNES", "libelle": "Course démo",
-            "heure": int(d.replace(hour=13, minute=55).timestamp() * 1000), "mini": False,
-            "distance": 2850, "discipline": "ATTELE",
+    return {"date": d.strftime("%d%m%Y"), "r": 1, "c": 3 if hh == 13 else hh, "hippodrome": "VINCENNES", "libelle": "Course démo",
+            "heure": int(d.replace(hour=hh, minute=mm).timestamp() * 1000), "mini": False,
+            "distance": 2850, "discipline": "ATTELE" if hh in (13, 17) else "PLAT",
             "partants": partants, "arrivee": arr, "rapports": demo_definitifs(partants, arr, rnd)}
 
 
@@ -794,6 +796,9 @@ header{align-items:center}
 .optim ul{margin:0;padding-left:18px}
 .optim .copie{justify-self:start;margin-top:4px}
 .bilan details{margin-top:12px}
+table.btab.ttab{min-width:0}
+table.ttab td.l,table.ttab th.l{white-space:normal}
+table.ttab th,table.ttab td{padding:7px 6px}
 tr.grp td{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding-top:12px}
 .tk{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
 .tk:last-child{border-bottom:0}
@@ -865,8 +870,10 @@ table.btab{min-width:620px}
   <div class="choix" style="margin:0 0 8px">
     <div class="champ"><label for="periode">Période testée</label>
       <select id="periode"><option value="30">30 derniers jours</option><option value="90">3 derniers mois</option><option value="180">6 derniers mois</option></select></div>
-    <div class="champ"><label for="joues">Jours joués</label>
-      <select id="joues"><option value="tous">Tous les jours</option><option value="jouable">Sauf verdict défavorable</option><option value="favorable">Seulement verdict favorable</option></select></div>
+    <div class="champ"><label for="parjour">Courses par jour</label>
+      <select id="parjour"><option value="1">1, vers 13h55</option><option value="4">4, du matin au soir</option></select></div>
+    <div class="champ"><label for="joues">Courses jouées</label>
+      <select id="joues"><option value="tous">Toutes</option><option value="jouable">Sauf verdict défavorable</option><option value="favorable">Seulement verdict favorable</option></select></div>
   </div>
   <p class="sub" id="bEtat">Chargement…</p>
   <div class="bcartes" id="bCartes"></div>
@@ -874,7 +881,7 @@ table.btab{min-width:620px}
   <div id="optimRes" class="optim" hidden></div>
   <details><summary>Résultats par type de course</summary>
     <p class="sub">Part de la mise récupérée avec ton style actuel, comparée aux favoris. Moins il y a de courses dans une ligne, moins le chiffre est fiable.</p>
-    <div class="tablewrap"><table class="btab"><thead><tr><th class="l">Type de course</th><th>Courses</th><th>Appli</th><th>Favoris</th></tr></thead><tbody id="bTypes"></tbody></table></div>
+    <div class="tablewrap"><table class="btab ttab"><thead><tr><th class="l">Type de course</th><th>Courses</th><th>Appli</th><th>Favoris</th></tr></thead><tbody id="bTypes"></tbody></table></div>
   </details>
   <details><summary>Détail jour par jour</summary>
     <div class="tablewrap"><table class="btab"><thead><tr><th class="l">Jour</th><th class="l">Course</th><th class="l">Arrivée</th><th>Prudent</th><th>Équilibré</th><th>Outsiders</th><th>Favoris</th></tr></thead><tbody id="bCorps"></tbody></table></div>
@@ -1427,8 +1434,10 @@ const estOrdre = (t, l) => !estDesordre(l) && (/ordre/i.test(l) || ORDONNES.has(
 function calerK(t) {                // chaque jour n'est calculé qu'une fois
   const A = [], O = [], kind = PARIS[t].kind, c = bilanCache[t]; if (!c || !c.jours) return;
   const memo = c.kjours || (c.kjours = new Map());
+  const vues = new Set();
   for (const [date, j] of c.jours) {
     if (!j) continue;
+    const cleC = j.date + "-" + j.r + "-" + j.c; if (vues.has(cleC)) continue; vues.add(cleC);
     let r = memo.get(date);
     if (!r) {
       r = {A: [], O: []};
@@ -1659,6 +1668,19 @@ const memoire = {
   },
 };
 const jjmmaaaa = d => String(d.getDate()).padStart(2, "0") + String(d.getMonth() + 1).padStart(2, "0") + d.getFullYear();
+// Le test peut rejouer 1 course par jour (la plus proche de 13h55) ou 4, réparties dans la journée.
+const HEURES_4 = ["11:30", HEURE_CIBLE, "15:45", "17:45"];
+try { const pj = localStorage.getItem("ml_parjour"); if (pj) $("parjour").value = pj; } catch (e) {}
+const heuresTest = () => $("parjour").value === "4" ? HEURES_4 : [HEURE_CIBLE];
+const idJour = (d, h) => h === HEURE_CIBLE ? d : d + "@" + h;        // identifiant d'une course testée (jour + heure visée)
+function idsPasses(n, heures) { const out = []; for (const d of datesPassees(n)) for (const h of heures) out.push({id: idJour(d, h), d, h}); return out; }
+// Courses chargées pour la période, sans doublon : deux heures visées peuvent tomber sur la même course
+function coursesTest(cache, n, heures) {
+  const out = [], vues = new Set();
+  for (const x of idsPasses(n, heures)) { const j = cache.jours.get(x.id); if (!j) continue;
+    const cle = j.date + "-" + j.r + "-" + j.c; if (vues.has(cle)) continue; vues.add(cle); out.push({id: x.id, d: x.d, j}); }
+  return out;
+}
 function datesPassees(n) { const out = []; for (let i = 1; i <= n; i++) { const d = new Date(); d.setDate(d.getDate() - i); out.push(jjmmaaaa(d)); } return out; }
 function coursesChargees(t) { const c = bilanCache[t]; return c ? [...c.jours.values()].filter(Boolean) : []; }
 
@@ -1674,18 +1696,18 @@ async function chargerBilan() {
   try {
     if (!c.jours) { $("bCartes").innerHTML = ""; $("bCorps").innerHTML = ""; $("bEtat").textContent = "Chargement…"; c.jours = await memoire.lire(t); }
     let arret = ""; const essayes = new Set();
+    const garder = new Set(idsPasses(190, HEURES_4).map(x => x.id));
     while (t === pari) {
-      const voulues = datesPassees(periode()), manque = voulues.filter(d => !c.jours.has(d) && !essayes.has(d));
+      const voulues = idsPasses(periode(), heuresTest()), manque = voulues.filter(x => !c.jours.has(x.id) && !essayes.has(x.id));
       if (!manque.length) break;
-      bilanAvance = `Chargement des courses passées : ${voulues.length - manque.length} jours sur ${voulues.length}… `;
+      bilanAvance = `Chargement des courses passées : ${voulues.length - manque.length} sur ${voulues.length}… `;
       afficher();
-      const lot = manque.slice(0, 10);
-      const r = await fetch(`/api/bilan?dates=${lot.join(",")}&heure=${HEURE_CIBLE}&pari=${t}`); const j = await r.json();
+      const h = manque[0].h, lot = manque.filter(x => x.h === h).slice(0, 10);
+      const r = await fetch(`/api/bilan?dates=${lot.map(x => x.d).join(",")}&heure=${h}&pari=${t}`); const j = await r.json();
       if (!r.ok) throw new Error(j.erreur || "Test indisponible");
-      const faits = Object.keys(j.resultats);
-      for (const d of lot) essayes.add(d);
-      for (const d of faits) c.jours.set(d, j.resultats[d]);
-      memoire.ecrire(t, j.resultats, new Set(datesPassees(190)));
+      const nouveaux = {};
+      for (const x of lot) { essayes.add(x.id); if (x.d in j.resultats) { c.jours.set(x.id, j.resultats[x.d]); nouveaux[x.id] = j.resultats[x.d]; } }
+      memoire.ecrire(t, nouveaux, garder);
       if (j.sature) { arret = "Le PMU limite les demandes pour le moment : le chargement reprendra à la prochaine ouverture de l'appli. "; break; }
     }
     bilanAvance = arret; afficher();
@@ -1737,12 +1759,12 @@ async function calculerBilan() {
   const w = poids(), k = tailleTicket(t), N = nbTickets(), multi = t === "MULTI";
   const cle = [t, k, N, CURSEURS.map(c => $(c).value).join("-")].join("|");
   if (bilanMemo.cle !== cle) { bilanMemo.cle = cle; bilanMemo.jours = new Map(); }
-  const dates = datesPassees(periode());
-  const aFaire = dates.filter(d => cache.jours.get(d) && !bilanMemo.jours.has(d));
+  const liste = coursesTest(cache, periode(), heuresTest());
+  const aFaire = liste.filter(x => !bilanMemo.jours.has(x.id));
   // calcul par tranches courtes, en rendant la main à l'écran entre deux
   let debut = performance.now(), faits = 0;
-  for (const d of aFaire) {
-    bilanMemo.jours.set(d, rejouerJour(t, k, N, w, cache.jours.get(d)));
+  for (const x of aFaire) {
+    bilanMemo.jours.set(x.id, rejouerJour(t, k, N, w, x.j));
     if (++faits % 3 === 0 && performance.now() - debut > 25) {
       if (faits % 30 === 0 || faits === 3) $("bEtat").textContent = bilanAvance + `Calcul du test : ${faits} courses sur ${aFaire.length}…`;
       await new Promise(r => setTimeout(r, 0));
@@ -1751,16 +1773,16 @@ async function calculerBilan() {
     }
   }
   if (tour !== bilanTour) return;
-  afficherBilan(t, k, N, multi, dates, cache);
+  afficherBilan(t, k, N, multi, liste);
 }
-function afficherBilan(t, k, N, multi, dates, cache) {
+function afficherBilan(t, k, N, multi, liste) {
   const mise = maMise(), cles = ["prudent", "equilibre", "outsiders", "fav"], st = {}, filtre = $("joues").value;
   const vide = () => ({n: 0, g: 0, mise: 0, ret: 0});
   for (const c of cles) st[c] = vide();
   const types = {}, lignes = [], cell = g => `<td class="${g ? "tr-down" : ""}">${g ? "✓ +" + euro(g) : "✗"}</td>`;
   let ecartes = 0, sansVerdict = 0;
-  for (const d of dates) {
-    const res = bilanMemo.jours.get(d), j = cache.jours.get(d); if (!res || !j) continue;
+  for (const {id, d, j} of liste) {
+    const res = bilanMemo.jours.get(id); if (!res) continue;
     // le filtre suit le verdict de ton style actuel ; les quatre cartes portent sur les mêmes jours, pour comparer à égalité
     const part = partRendue(t, res[style].v);
     if (filtre !== "tous") { if (part === null) { sansVerdict++; continue; } if (part < (filtre === "favorable" ? 1 : 0.85)) { ecartes++; continue; } }
@@ -1775,7 +1797,7 @@ function afficherBilan(t, k, N, multi, dates, cache) {
   }
   const carte = (titre, s, sous, actif) => `<div class="bcard${actif ? " actif" : ""}"><h3>${titre}</h3><div class="sub">${sous}</div>
       <div class="bnet ${s.ret - s.mise >= 0 ? "tr-down" : "tr-up"}">${signe(s.ret - s.mise)}</div>
-      <div class="sub"><b>${s.mise ? Math.round(100 * s.ret / s.mise) : 0} % de la mise récupérée</b> · ${s.g} jour${s.g > 1 ? "s" : ""} gagnant${s.g > 1 ? "s" : ""} sur ${s.n} · misé ${euro(s.mise)} · récupéré ${euro(s.ret)}</div></div>`;
+      <div class="sub"><b>${s.mise ? Math.round(100 * s.ret / s.mise) : 0} % de la mise récupérée</b> · ${s.g} course${s.g > 1 ? "s" : ""} gagnante${s.g > 1 ? "s" : ""} sur ${s.n} · misé ${euro(s.mise)} · récupéré ${euro(s.ret)}</div></div>`;
   $("bCartes").innerHTML = st.fav.n ? ["prudent", "equilibre", "outsiders"].map(c =>
       carte("Style " + STYLES[c].nom, st[c], c === style ? "ton style actuel" : (N > 1 ? "tickets de l'appli" : "ticket de l'appli"), c === style)).join("") +
     carte(k > 1 ? `Les ${k} favoris` : "Le favori", st.fav, k > 1 ? "les plus petites cotes, sans analyse" : "la plus petite cote, sans analyse") : "";
@@ -1787,10 +1809,11 @@ function afficherBilan(t, k, N, multi, dates, cache) {
   // le détail jour par jour n'est rempli que s'il est ouvert (plusieurs centaines de lignes sur 6 mois)
   const det = $("bCorps").closest("details");
   det._lignes = lignes; if (det.open) $("bCorps").innerHTML = lignes.join(""); else $("bCorps").innerHTML = "";
-  const tri = filtre === "tous" ? "" : ` Jours écartés par le filtre : ${ecartes}${sansVerdict ? `, plus ${sansVerdict} sans verdict` : ""}.`;
+  const tri = filtre === "tous" ? "" : ` Courses écartées par le filtre : ${ecartes}${sansVerdict ? `, plus ${sansVerdict} sans verdict` : ""}.`;
+  const quelles = heuresTest().length > 1 ? "jusqu'à 4 courses par jour proposant ce pari, du matin au soir" : `chaque jour, la course proposant ce pari la plus proche de ${HEURE_CIBLE.replace(":", "h")}`;
   $("bEtat").textContent = bilanAvance + (st.fav.n
-    ? `${st.fav.n} courses jouées, ${PARIS[t].nom}${multi ? " en " + k : ""} ${N > 1 ? ", " + N + " tickets" : ""} à ${euro(mise)} ${N > 1 ? "chacun" : "par jour"} : chaque jour, la course proposant ce pari la plus proche de ${HEURE_CIBLE.replace(":", "h")}.${tri} Gains calculés avec les vrais rapports du PMU et les cotes finales : en vrai, quelques minutes avant le départ, c'est un peu moins bon.`
-    : (bilanAvance ? "" : filtre === "tous" ? "Aucune course exploitable pour ce pari sur la période." : `Aucun jour ne passe ce filtre sur la période.${tri}`));
+    ? `${st.fav.n} courses jouées, ${PARIS[t].nom}${multi ? " en " + k : ""} ${N > 1 ? ", " + N + " tickets" : ""} à ${euro(mise)} ${N > 1 ? "chacun" : "par course"} : ${quelles}.${tri} Gains calculés avec les vrais rapports du PMU et les cotes finales : en vrai, quelques minutes avant le départ, c'est un peu moins bon.`
+    : (bilanAvance ? "" : filtre === "tous" ? "Aucune course exploitable pour ce pari sur la période." : `Aucune course ne passe ce filtre sur la période.${tri}`));
 }
 $("bCorps").closest("details").addEventListener("toggle", e => { if (e.target.open && e.target._lignes) $("bCorps").innerHTML = e.target._lignes.join(""); });
 
@@ -1810,13 +1833,12 @@ async function chercherReglage() {
   const t = pari, cache = bilanCache[t], box = $("optimRes"); box.hidden = false;
   const k = tailleTicket(t), N = nbTickets();
   const jeu = [];
-  for (const d of datesPassees(periode()).reverse()) {          // du plus ancien au plus récent
-    const j = cache && cache.jours && cache.jours.get(d); if (!j) continue;
+  for (const {j} of (cache && cache.jours ? coursesTest(cache, periode(), heuresTest()) : []).reverse()) {          // du plus ancien au plus récent
     const P = j.partants.filter(c => c.partant), arr = j.arrivee.slice(0, 3).map(nm => P.findIndex(c => c.num === nm));
     if (P.length < Math.max(k + 1, 5) || arr.length < 3 || arr.some(i => i < 0)) continue;
     jeu.push({j, arr, comp: composantes(P, {}, ctxJour(j))});
   }
-  if (jeu.length < 40) { box.innerHTML = `<b class="t">Pas assez de courses</b><span class="sub">Il en faut au moins 40 pour régler puis vérifier (${jeu.length} chargées). Choisis « 3 derniers mois » ou « 6 derniers mois » et attends la fin du chargement.</span>`; return; }
+  if (jeu.length < 40) { box.innerHTML = `<b class="t">Pas assez de courses</b><span class="sub">Il en faut au moins 40 pour régler puis vérifier (${jeu.length} chargées). Choisis une période plus longue ou « 4 courses par jour », et attends la fin du chargement.</span>`; return; }
   box.innerHTML = '<span class="sub">Recherche en cours…</span>';
   await new Promise(r => setTimeout(r, 30));
   const coupe = Math.round(jeu.length * 0.6), regl = jeu.slice(0, coupe), verif = jeu.slice(coupe);
@@ -1860,6 +1882,7 @@ async function chercherReglage() {
   };
 }
 $("optim").addEventListener("click", () => { chercherReglage().catch(e => { $("optimRes").hidden = false; $("optimRes").textContent = "Recherche impossible : " + e.message; }); });
+$("parjour").addEventListener("change", e => { try { localStorage.setItem("ml_parjour", e.target.value); } catch (_) {} chargerBilan(); });
 $("joues").addEventListener("change", e => { try { localStorage.setItem("ml_joues", e.target.value); } catch (_) {} calculerBilan(); });
 try { const jo = localStorage.getItem("ml_joues"); if (jo) $("joues").value = jo; } catch (e) {}
 
