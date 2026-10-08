@@ -1252,8 +1252,8 @@ function majRepere(P) {
     <p>Bases (les 3 favoris) :</p><div class="nums">${bases.map(pq).join("")}</div>
     <p>Associés (favoris n°4 à 7) :</p><div class="nums">${asso.map(pq).join("")}</div>
     <p>6 combinaisons : ${euro(18)} en mise de base, ${euro(4.5)} en Flexi 25 %, ${euro(9)} en Flexi 50 %.</p>
-    <p class="sub">Sur 6 mois de vraies courses de ce type (62 courses), cette combinaison a gagné 13 fois, environ 1 course sur 5, pour des gains de 25 à 284 € pour 18 € misés, et rendu environ 1,4 fois la mise. Rien ne garantit que ça continue : attends-toi à des séries d'une dizaine de courses perdues.</p>
-    <p class="sub">Plus risqué : Multi en 4 avec les mêmes bases et associés (4 combinaisons, ${euro(12)}) : 6 courses gagnées sur 62, environ 2 fois la mise.</p>
+    <p class="sub">Sur toutes les courses de ce type pendant 6 mois (738 courses), cette combinaison a gagné 130 fois, environ 1 course sur 6, et a rendu à peu près la mise (98 € pour 100 €). Dans les autres courses de Multi, la même combinaison ne rend que 64 € : c'est pour ça que ces courses sont repérées. Ce n'est pas un pari gagnant, c'est celui qui perd le moins, et seulement joué dans les toutes dernières minutes : choisie avec les cotes du matin, la même combinaison ne rend que 54 €.</p>
+    <p class="sub">Plus risqué : Multi en 4 avec les mêmes bases et associés (4 combinaisons, ${euro(12)}) : gagné 45 fois sur 736, environ 1,07 fois la mise, avec de très grands écarts d'un mois à l'autre.</p>
     <p class="sub">Les numéros suivent les cotes en direct : vérifie-les juste avant le départ.</p>`;
   box.hidden = false;
 }
