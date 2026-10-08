@@ -142,6 +142,7 @@ def liste_courses(jour):
     for reu in data.get("programme", {}).get("reunions", []):
         r = reu.get("numOfficiel")
         hippo = (reu.get("hippodrome") or {}).get("libelleCourt", "")
+        pays = (reu.get("pays") or {}).get("code", "")
         for c in reu.get("courses", []):
             paris, mini = paris_course(c)
             out.append({
@@ -149,7 +150,7 @@ def liste_courses(jour):
                 "libelle": c.get("libelle", ""), "heure": c.get("heureDepart"),
                 "discipline": c.get("discipline", ""), "distance": c.get("distance"),
                 "partants": c.get("nombreDeclaresPartants"), "paris": paris, "mini": mini,
-                "statut": c.get("statut", ""), "handicap": est_handicap(c),
+                "statut": c.get("statut", ""), "handicap": est_handicap(c), "pays": pays,
                 "arrivee": [n for g in (c.get("ordreArrivee") or []) for n in (g if isinstance(g, list) else [g])][:5],
             })
     out.sort(key=lambda x: x["heure"] or 0)
@@ -416,6 +417,88 @@ def types_jours(dates):
     return {"resultats": resultats, "sature": time.time() < PMU_ETAT["pause"]}
 
 
+# ------------------------------------------------------------------ collecte complète : toutes les courses d'un jour
+def type_brut(t):
+    """E_SIMPLE_PLACE_INTERNATIONAL -> (SIMPLE_PLACE, False) ; E_MINI_MULTI -> (MULTI, True)."""
+    t = str(t or "").upper()
+    t = t[2:] if t.startswith("E_") else t
+    t = t.replace("_INTERNATIONAL", "").replace("TIERCÉ", "TIERCE")
+    return ("MULTI", True) if t == "MINI_MULTI" else (t, False)
+
+
+def tous_rapports(jour, r, c):
+    """Tous les rapports définitifs, y compris les paris étrangers : {TYPE: [[combinaison], € pour 1 €, libellé]}.
+    Les erreurs PMU remontent (pour reconnaître la saturation)."""
+    try:
+        data = get_json(f"{API}/{jour}/R{r}/C{c}/rapports-definitifs?specialisation=INTERNET")
+    except urllib.error.HTTPError as e:
+        if e.code in (204, 404):
+            return {}
+        raise
+    if isinstance(data, dict):
+        data = next((v for v in data.values() if isinstance(v, list)), [])
+    out = {}
+    for pari in data or []:
+        t, _ = type_brut(pari.get("typePari"))
+        if not t or pari.get("rembourse"):
+            continue
+        for rp in pari.get("rapports", []) or []:
+            d = rp.get("dividendePourUnEuro")
+            try:
+                comb = [int(x) for x in str(rp.get("combinaison", "")).split("-")]
+            except ValueError:
+                continue
+            if d:
+                out.setdefault(t, []).append([comb, d / 100, str(rp.get("libelle", ""))])
+    return out
+
+
+COMPLET_PAR_APPEL = 6
+
+
+def collecte_jour(jour, debut):
+    """Courses terminées du jour, par paquets : {"courses": [...], "suite": index suivant ou None, "total": n, "sature": bool}.
+    Format compact par course ; partants = [num, cote matin, cote finale, place (0 = hors des 5 premiers), partant 1/0]."""
+    CONTEXTE.fond = True
+    if DEMO:
+        if debut:
+            return {"courses": [], "suite": None, "total": 0, "sature": False}
+        i = (datetime.now() - datetime.strptime(jour, "%d%m%Y")).days
+        out = []
+        for h in ("11:30", "13:55", "15:45", "17:45"):
+            j = demo_jour(i, h)
+            out.append({"date": jour, "r": j["r"], "c": j["c"], "hippodrome": j["hippodrome"], "pays": "FRA", "heure": j["heure"],
+                        "discipline": j["discipline"], "distance": j["distance"], "handicap": (int(jour[:2]) + j["c"]) % 3 == 0,
+                        "mini": False, "arrivee": j["arrivee"],
+                        "partants": [[p["num"], p.get("coteMatin"), p.get("coteDirect"), (j["arrivee"].index(p["num"]) + 1) if p["num"] in j["arrivee"] else 0,
+                                      1 if p["partant"] else 0] for p in j["partants"]],
+                        "rapports": {t: [[x["c"], x["d"], x["l"]] for x in v] for t, v in j["rapports"].items()}})
+        return {"courses": out, "suite": None, "total": len(out), "sature": False}
+    if time.time() < PMU_ETAT["pause"]:
+        return {"courses": [], "suite": debut, "total": 0, "sature": True}
+    if jour not in PROG_CACHE:
+        PROG_CACHE[jour] = liste_courses(jour)
+    toutes = [c for c in PROG_CACHE[jour] if len(c.get("arrivee") or []) >= 3]
+    out = []
+    i = debut
+    try:
+        while i < len(toutes) and i < debut + COMPLET_PAR_APPEL:
+            c = toutes[i]
+            partants, arrivee = lire_partants(jour, c["r"], c["c"], arrivee_connue=c.get("arrivee"), chercher_arrivee=False)
+            out.append({"date": jour, "r": c["r"], "c": c["c"], "hippodrome": c["hippodrome"], "pays": c.get("pays", ""), "heure": c["heure"],
+                        "discipline": c.get("discipline"), "distance": c.get("distance"), "handicap": bool(c.get("handicap")),
+                        "mini": c.get("mini"), "libelle": c.get("libelle"), "arrivee": arrivee,
+                        "partants": [[p["num"], p["coteMatin"], p["coteDirect"], (arrivee.index(p["num"]) + 1) if p["num"] in arrivee else 0,
+                                      1 if p["partant"] else 0] for p in partants],
+                        "rapports": tous_rapports(jour, c["r"], c["c"])})
+            i += 1
+    except urllib.error.HTTPError as e:
+        if e.code not in SATURE:
+            raise
+        return {"courses": out, "suite": i, "total": len(toutes), "sature": True}
+    return {"courses": out, "suite": i if i < len(toutes) else None, "total": len(toutes), "sature": False}
+
+
 # ------------------------------------------------------------------ mode démo
 
 _demo_state = {}
@@ -659,6 +742,11 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/bilan":
                 dates = [d for d in q.get("dates", "").split(",") if len(d) == 8 and d.isdigit()][:12]
                 return self.envoyer(200, json.dumps(bilan(dates, q.get("heure", "13:55"), pari)))
+            if u.path == "/api/complet":
+                d = q.get("date", "")
+                if not (len(d) == 8 and d.isdigit()):
+                    return self.envoyer(400, json.dumps({"erreur": "date invalide"}))
+                return self.envoyer(200, json.dumps(collecte_jour(d, int(q.get("debut", "0") or 0))))
             if u.path == "/api/types":
                 dates = [d for d in q.get("dates", "").split(",") if len(d) == 8 and d.isdigit()][:20]
                 return self.envoyer(200, json.dumps(types_jours(dates)))
@@ -929,6 +1017,12 @@ table.btab{min-width:620px}
   </details>
   <button class="copie" id="exporter" type="button">Exporter les courses du test</button>
   <p class="sub" id="exportEtat" hidden></p>
+  <details id="complet"><summary>Collecte complète : toutes les courses de chaque jour, sur 6 mois</summary>
+    <p class="sub">Charge toutes les courses de chaque journée (une cinquantaine par jour, réunions étrangères comprises), avec la cote du matin, la cote finale, l'arrivée et tous les rapports du PMU. Compte environ 1 h 30 pour 6 mois : garde l'appli ouverte, écran allumé. Tu peux l'arrêter et la reprendre quand tu veux, elle repart où elle s'était arrêtée.</p>
+    <button class="copie" id="cLancer" type="button">Lancer la collecte</button>
+    <button class="copie" id="cExport" type="button">Exporter le fichier complet</button>
+    <p class="sub" id="cEtat"></p>
+  </details>
 </section>
 
 <div class="tablewrap">
@@ -2023,6 +2117,78 @@ async function exporterCourses() {
   setTimeout(() => URL.revokeObjectURL(a.href), 60000);
   et.textContent = `Fichier « ${nom} » enregistré dans tes Téléchargements (${liste.length} courses, ${(blob.size / 1e6).toFixed(1).replace(".", ",")} Mo).`;
 }
+// ---------- collecte complète : toutes les courses de chaque jour, gardées sur le téléphone (base à part)
+const complet = {
+  db: null, actif: false, lock: null,
+  ouvrir() {
+    if (this.db !== null) return this.db;
+    this.db = new Promise(res => { try { const rq = indexedDB.open("multilive-complet", 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore("jours");
+      rq.onsuccess = () => res(rq.result); rq.onerror = () => res(null); rq.onblocked = () => res(null); } catch (e) { res(null); } });
+    return this.db;
+  },
+  async tout() {
+    const db = await this.ouvrir(); if (!db) return new Map();
+    return new Promise(res => { const m = new Map(); try {
+      const rq = db.transaction("jours").objectStore("jours").openCursor();
+      rq.onsuccess = e => { const c = e.target.result; if (!c) return res(m); m.set(c.key, c.value); c.continue(); }; rq.onerror = () => res(m);
+    } catch (e) { res(m); } });
+  },
+  async poser(d, v) { const db = await this.ouvrir(); if (!db) return;
+    return new Promise(res => { try { const tx = db.transaction("jours", "readwrite"); tx.objectStore("jours").put(v, d); tx.oncomplete = res; tx.onerror = res; } catch (e) { res(); } }); },
+};
+const NB_JOURS_COMPLET = 183;
+async function etatComplet(enCours, mem) {
+  const m = mem || await complet.tout(), voulus = datesPassees(NB_JOURS_COMPLET);
+  const faits = voulus.filter(d => m.has(d)).length, nc = voulus.reduce((n, d) => n + (m.get(d) || []).length, 0);
+  $("cEtat").textContent = `Jours complets : ${faits} sur ${voulus.length} · ${nc} courses gardées.` + (enCours ? " " + enCours : "");
+  return {m, voulus};
+}
+async function collecter() {
+  if (complet.actif) { complet.actif = false; $("cLancer").textContent = "Lancer la collecte"; return; }
+  complet.actif = true; $("cLancer").textContent = "Arrêter la collecte";
+  try { if (navigator.wakeLock) complet.lock = await navigator.wakeLock.request("screen"); } catch (e) {}
+  let msg = "";
+  try {
+    const {m, voulus} = await etatComplet();
+    for (let i = 0; i < voulus.length; ) {
+      const d = voulus[i];
+      if (!complet.actif) { msg = "Collecte arrêtée. Elle reprendra où elle s'est arrêtée."; break; }
+      if (m.has(d)) { i++; continue; }
+      let debut = 0, courses = [], sature = false;
+      while (debut !== null && complet.actif) {
+        await etatComplet(`En cours : ${d.slice(0, 2)}/${d.slice(2, 4)} (${courses.length} courses)…`, m);
+        const r = await fetch(`/api/complet?date=${d}&debut=${debut}`), j = await r.json();
+        if (!r.ok) throw new Error(j.erreur || "erreur " + r.status);
+        courses = courses.concat(j.courses); debut = j.suite;
+        if (j.sature) { sature = true; break; }
+      }
+      if (sature) { msg = "Le PMU limite les demandes : pause de 3 minutes, la collecte reprend toute seule."; await etatComplet(msg, m);
+        for (let s = 0; s < 190 && complet.actif; s++) await new Promise(r => setTimeout(r, 1000)); continue; }   // même jour, de nouveau
+      if (debut === null) { await complet.poser(d, courses); m.set(d, courses); }
+      i++;
+    }
+    if (complet.actif) msg = "Collecte terminée.";
+  } catch (e) { msg = "Collecte interrompue (" + e.message + "). Relance-la pour reprendre."; }
+  complet.actif = false; $("cLancer").textContent = "Lancer la collecte";
+  try { if (complet.lock) await complet.lock.release(); } catch (e) {}
+  await etatComplet(msg);
+}
+async function exporterComplet() {
+  const {m, voulus} = await etatComplet("Préparation du fichier…");
+  const liste = []; let jours = 0;
+  for (const d of voulus) if (m.has(d)) { jours++; for (const c of m.get(d)) liste.push(c); }
+  if (!liste.length) { await etatComplet("Rien à exporter pour l'instant : lance d'abord la collecte."); return; }
+  const texte = JSON.stringify({format: "complet-v1", exporte: new Date().toISOString(), jours, courses: liste});
+  let blob = new Blob([texte], {type: "application/json"}), nom = `multi-live-complet-${jours}-jours-${liste.length}-courses.json`;
+  try { if (window.CompressionStream) { blob = await new Response(blob.stream().pipeThrough(new CompressionStream("gzip"))).blob(); blob = new Blob([blob], {type: "application/gzip"}); nom += ".gz"; } } catch (e) {}
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = nom; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  await etatComplet(`Fichier « ${nom} » enregistré dans tes Téléchargements (${(blob.size / 1e6).toFixed(1).replace(".", ",")} Mo).`);
+}
+$("cLancer").addEventListener("click", () => collecter());
+$("cExport").addEventListener("click", () => exporterComplet().catch(e => { $("cEtat").textContent = "Export impossible : " + e.message; }));
+$("complet").addEventListener("toggle", e => { if (e.target.open && !complet.actif) etatComplet(); });
 $("exporter").addEventListener("click", () => exporterCourses().catch(e => { $("exportEtat").hidden = false; $("exportEtat").textContent = "Export impossible : " + e.message; }));
 $("parjour").addEventListener("change", e => { try { localStorage.setItem("ml_parjour", e.target.value); } catch (_) {} chargerBilan(); });
 $("joues").addEventListener("change", e => { try { localStorage.setItem("ml_joues", e.target.value); } catch (_) {} calculerBilan(); });
