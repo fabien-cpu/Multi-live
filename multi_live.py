@@ -434,7 +434,7 @@ def demo_programme(jour):
         {"r": 1, "c": 1, "hippodrome": "VINCENNES", "libelle": "PRIX DE BAZOCHES", "heure": ms(base - timedelta(minutes=65)),
          "discipline": "ATTELE", "distance": 2700, "partants": 12, "paris": petit, "mini": False, "statut": "FIN_COURSE", "handicap": False},
         {"r": 1, "c": 3, "hippodrome": "VINCENNES", "libelle": "PRIX DE RUNGIS (démo)", "heure": ms(base),
-         "discipline": "ATTELE", "distance": 2850, "partants": 16, "paris": DEMO_PARIS, "mini": False, "statut": "PROGRAMMEE", "handicap": False},
+         "discipline": "ATTELE", "distance": 2850, "partants": 16, "paris": DEMO_PARIS, "mini": False, "statut": "PROGRAMMEE", "handicap": True},
         {"r": 2, "c": 5, "hippodrome": "LONGCHAMP", "libelle": "PRIX DES ETANGS", "heure": ms(base + timedelta(minutes=80)),
          "discipline": "PLAT", "distance": 1600, "partants": 11, "paris": petit + [{"t": "MULTI", "base": 3}, {"t": "PICK5", "base": 1}],
          "mini": True, "statut": "PROGRAMMEE", "handicap": True},
@@ -785,6 +785,9 @@ tr.sel .num{background:var(--turf);border-color:var(--turf);color:var(--surface)
 .bar{display:inline-block;height:6px;border-radius:3px;background:var(--turf);vertical-align:middle;margin-right:6px}
 svg.spark{vertical-align:middle}
 .err{margin-top:12px;padding:10px 12px;border:1px solid var(--up);color:var(--up);border-radius:8px}
+.repere{margin-top:12px;padding:12px 14px;border-radius:10px;border:2px solid var(--gold);background:color-mix(in srgb,var(--gold) 10%,transparent)}
+.repere h3{margin:0 0 6px;font-size:15px;color:var(--gold)} .repere .n{width:40px;height:40px;border-radius:8px;display:grid;place-items:center;font-size:17px;font-weight:700;background:var(--gold);color:var(--surface)}
+.repere .nums{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 4px} .repere p{margin:4px 0;font-size:13px}
 .res{margin-top:12px;padding:10px 12px;border-radius:8px;border:1px solid var(--gold);color:var(--gold);font-weight:600}
 .foot{color:var(--muted);font-size:12px;margin:18px 0 8px}
 .ticket .n.small{width:34px;height:34px;font-size:15px;border-radius:7px}
@@ -859,7 +862,7 @@ table.btab{min-width:620px}
 <div class="choix">
   <div class="champ"><label for="typeC">Type de course</label>
     <select id="typeC"><option value="tous">Toutes les courses</option><option value="attele">Trot attelé</option><option value="monte">Trot monté</option>
-      <option value="plat">Plat</option><option value="obstacle">Obstacles</option><option value="handicap">Handicaps</option><option value="sanshandicap">Sans handicap</option></select></div>
+      <option value="plat">Plat</option><option value="obstacle">Obstacles</option><option value="handicap">Handicaps</option><option value="sanshandicap">Sans handicap</option><option value="repere">★ Courses repérées</option></select></div>
   <div class="champ large"><label for="choixCourse">Course</label><select id="choixCourse"></select></div>
   <div class="champ"><label for="pari">Pari</label><select id="pari"></select></div>
   <div class="champ"><label for="style">Style</label>
@@ -879,6 +882,7 @@ table.btab{min-width:620px}
 </div>
 <div id="erreur" class="err" hidden></div>
 <div id="resultat" class="res" hidden></div>
+<div id="repere" class="repere" hidden></div>
 
 <section class="panel ticket">
   <h2 id="tTitre">Ticket conseillé</h2>
@@ -1124,15 +1128,40 @@ async function viaServeur(url, defaut) {
 }
 
 // ---------- type de course : un seul choix, qui trie à la fois les courses du jour et le test sur les courses passées
-const TYPES_C = {tous: "Toutes les courses", attele: "Trot attelé", monte: "Trot monté", plat: "Plat", obstacle: "Obstacles", handicap: "Handicaps", sanshandicap: "Sans handicap"};
+const TYPES_C = {repere: "★ Courses repérées", tous: "Toutes les courses", attele: "Trot attelé", monte: "Trot monté", plat: "Plat", obstacle: "Obstacles", handicap: "Handicaps", sanshandicap: "Sans handicap"};
 try { const ty = localStorage.getItem("ml_type"); if (ty && TYPES_C[ty]) $("typeC").value = ty; } catch (e) {}
 const nomDisc = d => { d = (d || "").toUpperCase(); return /ATTELE/.test(d) ? "Trot attelé" : /MONTE/.test(d) ? "Trot monté" : /PLAT/.test(d) ? "Plat" : /HAIE|STEEPLE|CROSS/.test(d) ? "Obstacles" : "Autre"; };
 function typeOk(c) {                 // c = course du jour ou course passée
   const v = $("typeC").value;
   if (v === "tous") return true;
+  if (v === "repere") return repereProg(c);
   if (v === "handicap") return c.handicap === true;
   if (v === "sanshandicap") return c.handicap === false;
   return nomDisc(c.discipline) === TYPES_C[v];
+}
+// ---------- courses repérées : la piste la plus solide du test sur 6 mois de vraies courses
+// Multi (14 partants ou plus, pas le Mini Multi), course à handicap ou course ouverte (favori à moins de 20 % de chances)
+// → Multi en 5, champ réduit : les 3 favoris en base, les favoris n°4 à 7 en associés (6 combinaisons).
+const multiVrai = c => (c.paris || []).some(p => p.t === "MULTI") && !c.mini;
+const repereProg = c => !!c && multiVrai(c) && c.handicap === true;        // visible dès le programme (sans les cotes)
+function majRepere(P) {
+  const box = $("repere"), optM = $("pari").querySelector('option[value="MULTI"]');
+  const avec = P.filter(c => c.coteDirect > 1).sort((a, b) => a.coteDirect - b.coteDirect);
+  const s = avec.reduce((x, c) => x + 1 / c.coteDirect, 0), favP = avec.length ? (1 / avec[0].coteDirect) / s : 1;
+  const ouverte = favP < 0.2, ok = multiVrai(courant) && (courant.handicap === true || ouverte) && avec.length >= 8;
+  if (optM) optM.textContent = (ok ? "★ " : "") + nomPari("MULTI", courant);        // étoile sur le pari à jouer
+  if (!ok) { box.hidden = true; return; }
+  const bases = avec.slice(0, 3).map(c => c.num), asso = avec.slice(3, 7).map(c => c.num);
+  const pq = n => `<span class="n">${n}</span>`;
+  box.innerHTML = `<h3>★ Course repérée : ${courant.handicap === true ? "handicap" : "course ouverte"}${courant.handicap === true && ouverte ? " et course ouverte" : ""}</h3>
+    <p><b>★ Combinaison conseillée : Multi en 5, champ réduit</b></p>
+    <p>Bases (les 3 favoris) :</p><div class="nums">${bases.map(pq).join("")}</div>
+    <p>Associés (favoris n°4 à 7) :</p><div class="nums">${asso.map(pq).join("")}</div>
+    <p>6 combinaisons : ${euro(18)} en mise de base, ${euro(4.5)} en Flexi 25 %, ${euro(9)} en Flexi 50 %.</p>
+    <p class="sub">Sur 6 mois de vraies courses de ce type (62 courses), cette combinaison a gagné 13 fois, environ 1 course sur 5, pour des gains de 25 à 284 € pour 18 € misés, et rendu environ 1,4 fois la mise. Rien ne garantit que ça continue : attends-toi à des séries d'une dizaine de courses perdues.</p>
+    <p class="sub">Plus risqué : Multi en 4 avec les mêmes bases et associés (4 combinaisons, ${euro(12)}) : 6 courses gagnées sur 62, environ 2 fois la mise.</p>
+    <p class="sub">Les numéros suivent les cotes en direct : vérifie-les juste avant le départ.</p>`;
+  box.hidden = false;
 }
 function procheDe1355(pool) {
   const [h, m] = HEURE_CIBLE.split(":").map(Number), cible = new Date(); cible.setHours(h, m, 0, 0);
@@ -1169,7 +1198,7 @@ function remplirCourses() {
   for (const c of (ok.length ? ok : courses)) {
     const o = document.createElement("option");
     o.value = c.r + "-" + c.c;
-    o.textContent = `${c.heure ? hhmm(c.heure) : "--:--"}  R${c.r}C${c.c} ${c.hippodrome}${offre(c, prefPari) ? "  · " + nomPari(prefPari, c) : ""}`;
+    o.textContent = `${repereProg(c) ? "★ " : ""}${c.heure ? hhmm(c.heure) : "--:--"}  R${c.r}C${c.c} ${c.hippodrome}${offre(c, prefPari) ? "  · " + nomPari(prefPari, c) : ""}`;
     sel.appendChild(o);
   }
   if (courant) sel.value = courant.r + "-" + courant.c;
@@ -1180,7 +1209,7 @@ $("choixCourse").addEventListener("change", e => {
 });
 
 function choisir(c) {
-  courant = c; donnees = null;
+  courant = c; donnees = null; $("repere").hidden = true;
   $("choixCourse").value = c.r + "-" + c.c;
   // paris proposés sur cette course
   const sel = $("pari"); sel.innerHTML = "";
@@ -1578,6 +1607,7 @@ function gainReel(t, k, nums, raps) {
 function calculer() {
   if (!donnees || !courant) return;
   const tous = donnees.partants, P = tous.filter(c => c.partant), n = P.length;
+  try { majRepere(P); } catch (e) { $("repere").hidden = true; }
   const t = pari, info = PARIS[t], k = tailleTicket(t), mise = maMise();
   const base = ((courant.paris || []).find(p => p.t === t) || {}).base;
   const w = poids(); for (const kk in w) $("v" + kk).textContent = w[kk];
